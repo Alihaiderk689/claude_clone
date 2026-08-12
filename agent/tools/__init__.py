@@ -1,0 +1,66 @@
+"""Project-inspection and approval-gated editing tools available to the agent."""
+from __future__ import annotations
+
+from typing import Optional
+
+from ..project import ProjectRoot
+from .base import Tool, ToolError, ToolResult
+from .editing import apply_change, build_edit_file_tool, build_write_file_tool
+from .filesystem import build_list_files_tool, build_read_file_tool
+from .git import (
+    apply_git_operation,
+    build_git_commit_tool,
+    build_git_create_branch_tool,
+    build_git_diff_tool,
+    build_git_log_tool,
+    build_git_stage_tool,
+    build_git_status_tool,
+)
+from .registry import ToolRegistry
+from .search import build_search_files_tool
+from .state import FileStateTracker
+from .terminal import build_run_command_tool, execute_command
+
+
+def build_default_registry(
+    project: ProjectRoot, tracker: Optional[FileStateTracker] = None
+) -> ToolRegistry:
+    """Assemble the full toolset for a given project root.
+
+    `tracker` is shared between read_file (which records what the model has
+    seen) and edit_file (which checks it before proposing a change) so a
+    stale edit can be caught. Pass the same tracker to run_agent_turn so
+    apply_change() updates it after a write too — see cli.py's wiring.
+
+    Git tools are always registered, even outside a Git repository -- each
+    one reports "This project is not a Git repository" gracefully rather
+    than being conditionally hidden (see agent/tools/git.py).
+    """
+    tracker = tracker if tracker is not None else FileStateTracker()
+    registry = ToolRegistry()
+    registry.register(build_list_files_tool(project))
+    registry.register(build_read_file_tool(project, tracker))
+    registry.register(build_search_files_tool(project))
+    registry.register(build_edit_file_tool(project, tracker))
+    registry.register(build_write_file_tool(project, tracker))
+    registry.register(build_run_command_tool(project))
+    registry.register(build_git_status_tool(project))
+    registry.register(build_git_diff_tool(project))
+    registry.register(build_git_log_tool(project))
+    registry.register(build_git_create_branch_tool(project))
+    registry.register(build_git_stage_tool(project))
+    registry.register(build_git_commit_tool(project))
+    return registry
+
+
+__all__ = [
+    "Tool",
+    "ToolError",
+    "ToolResult",
+    "ToolRegistry",
+    "FileStateTracker",
+    "apply_change",
+    "apply_git_operation",
+    "execute_command",
+    "build_default_registry",
+]

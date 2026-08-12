@@ -1,0 +1,4 @@
+requests>=2.31
+rich>=13.7
+pydantic>=2.5
+pytest>=8.0
