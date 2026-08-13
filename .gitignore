@@ -24,3 +24,16 @@ htmlcov/
 # Environment variables
 .env
 .env.*
+
+# Node / VS Code extension build output
+vscode-extension/node_modules/
+vscode-extension/out/
+vscode-extension/*.vsix
+npm-debug.log*
+
+# Local agent server runtime state (never commit real tokens)
+.code-agent/
+server.json
+
+# Benchmark output
+benchmark_report.json

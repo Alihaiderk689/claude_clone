@@ -20,6 +20,7 @@ from agent.tools.git import (
     build_git_create_branch_tool,
     build_git_diff_tool,
     build_git_log_tool,
+    build_git_push_tool,
     build_git_stage_tool,
     build_git_status_tool,
     is_git_repository,
@@ -52,6 +53,27 @@ def project(repo):
 def non_git_project(tmp_path):
     (tmp_path / "some_file.py").write_text("x = 1\n")
     return ProjectRoot(tmp_path)
+
+
+@pytest.fixture
+def bare_remote(tmp_path):
+    """A real local bare repo standing in for a GitHub-style remote -- no
+    network involved, but git_push's actual `git push` invocation is 100%
+    real, same philosophy as the rest of this file."""
+    bare_dir = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare_dir)], check=True, capture_output=True)
+    return bare_dir
+
+
+@pytest.fixture
+def repo_with_remote(repo, bare_remote):
+    run_git(repo, "remote", "add", "origin", str(bare_remote))
+    return repo
+
+
+@pytest.fixture
+def project_with_remote(repo_with_remote):
+    return ProjectRoot(repo_with_remote)
 
 
 class TestIsGitRepository:
@@ -398,11 +420,232 @@ class TestApplyGitOperation:
         assert "not a git repository" in result.output.lower()
 
 
+class TestGitUnavailableAndTimeout:
+    """Phase 8: _run_git must never let a raw FileNotFoundError/
+    TimeoutExpired escape -- both the read-only tools (already protected by
+    Tool.execute()'s catch-all) AND apply_git_operation (called directly
+    from loop.py with NO such safety net) must convert these into a normal
+    failed result instead of crashing the turn."""
+
+    def test_status_reports_git_unavailable_instead_of_crashing(self, project):
+        with mock.patch("agent.tools.git.subprocess.run", side_effect=FileNotFoundError()):
+            result = build_git_status_tool(project).execute({})
+        assert not result.ok
+        assert result.error_type == "ExternalToolUnavailableError"
+        assert result.recoverable is False
+
+    def test_status_reports_timeout_instead_of_crashing(self, project):
+        with mock.patch(
+            "agent.tools.git.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=15),
+        ):
+            result = build_git_status_tool(project).execute({})
+        assert not result.ok
+        assert result.error_type == "TimeoutError"
+        assert result.recoverable is True
+
+    def test_apply_git_operation_does_not_raise_when_git_binary_missing(self, repo):
+        """The critical regression test: apply_git_operation is called
+        directly from loop.py, not through Tool.execute() -- before this
+        fix, a FileNotFoundError here would propagate uncaught and abort
+        the whole agent turn instead of reporting a normal tool failure."""
+        from agent.git_policy import ProposedGitOperation
+
+        op = ProposedGitOperation(kind="create_branch", repo_root=repo, branch_name="feature/x")
+        with mock.patch("agent.tools.git.subprocess.run", side_effect=FileNotFoundError()):
+            result = apply_git_operation(op)  # must not raise
+        assert not result.ok
+        assert "not installed" in result.output.lower() or "not available" in result.output.lower()
+        assert result.error_type == "ExternalToolUnavailableError"
+
+    def test_apply_git_operation_does_not_raise_on_timeout(self, repo):
+        from agent.git_policy import ProposedGitOperation
+
+        op = ProposedGitOperation(kind="create_branch", repo_root=repo, branch_name="feature/x")
+        with mock.patch(
+            "agent.tools.git.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=15),
+        ):
+            result = apply_git_operation(op)  # must not raise
+        assert not result.ok
+        assert "timeout" in result.output.lower() or "timed out" in result.output.lower()
+        assert result.error_type == "TimeoutError"
+
+    def test_apply_git_operation_stage_does_not_raise_when_git_binary_missing(self, repo):
+        from agent.git_policy import ProposedGitOperation
+
+        op = ProposedGitOperation(kind="stage", repo_root=repo, paths=["README.md"])
+        with mock.patch("agent.tools.git.subprocess.run", side_effect=FileNotFoundError()):
+            result = apply_git_operation(op)
+        assert not result.ok
+        assert result.error_type == "ExternalToolUnavailableError"
+
+
+class TestGitPushPropose:
+    def test_valid_push_is_proposed(self, project_with_remote):
+        result = build_git_push_tool(project_with_remote).execute({})
+        assert result.ok
+        assert result.pending_git_operation is not None
+        op = result.pending_git_operation
+        assert op.kind == "push"
+        assert op.remote == "origin"
+        assert op.branch_name  # whatever git's default init branch is named
+
+    def test_default_remote_is_origin(self, project_with_remote):
+        result = build_git_push_tool(project_with_remote).execute({})
+        assert result.pending_git_operation.remote == "origin"
+
+    def test_remote_url_is_captured_for_display(self, project_with_remote, bare_remote):
+        result = build_git_push_tool(project_with_remote).execute({})
+        assert result.pending_git_operation.remote_url == str(bare_remote)
+
+    def test_unconfigured_remote_rejected(self, project_with_remote):
+        result = build_git_push_tool(project_with_remote).execute({"remote": "upstream"})
+        assert not result.ok
+        assert "not configured" in result.output.lower()
+        assert result.pending_git_operation is None
+
+    def test_no_remote_at_all_rejected(self, project):
+        """`project` (no bare_remote fixture) has no remote configured."""
+        result = build_git_push_tool(project).execute({})
+        assert not result.ok
+        assert "not configured" in result.output.lower()
+
+    def test_invalid_remote_name_rejected_before_touching_git(self, project_with_remote):
+        result = build_git_push_tool(project_with_remote).execute({"remote": "--upload-pack=evil"})
+        assert not result.ok
+
+    def test_non_git_repo_rejected(self, non_git_project):
+        result = build_git_push_tool(non_git_project).execute({})
+        assert not result.ok
+        assert "not a git repository" in result.output.lower()
+
+    def test_commits_preview_is_populated_for_a_new_branch(self, project_with_remote):
+        result = build_git_push_tool(project_with_remote).execute({})
+        preview = result.pending_git_operation.commits_preview
+        assert preview
+        assert "nothing to push" not in preview.lower()
+
+    def test_detached_head_rejected(self, project_with_remote, repo_with_remote):
+        sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo_with_remote), capture_output=True, text=True
+        ).stdout.strip()
+        run_git(repo_with_remote, "checkout", "-q", sha)
+
+        result = build_git_push_tool(project_with_remote).execute({})
+        assert not result.ok
+        assert "detached" in result.output.lower()
+
+    def test_display_never_shows_a_force_flag(self, project_with_remote):
+        result = build_git_push_tool(project_with_remote).execute({})
+        assert "force" not in result.display.lower()
+
+
+class TestApplyGitPush:
+    def test_push_succeeds_and_lands_on_the_remote(self, project_with_remote, bare_remote):
+        propose = build_git_push_tool(project_with_remote).execute({})
+        result = apply_git_operation(propose.pending_git_operation)
+
+        assert result.ok
+        remote_log = subprocess.run(
+            ["git", "log", "--oneline", "--all"], cwd=str(bare_remote), capture_output=True, text=True
+        ).stdout
+        assert "Initial commit" in remote_log
+
+    def test_push_sets_upstream_tracking(self, project_with_remote, repo_with_remote):
+        propose = build_git_push_tool(project_with_remote).execute({})
+        apply_git_operation(propose.pending_git_operation)
+
+        tracking = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            cwd=str(repo_with_remote), capture_output=True, text=True,
+        )
+        assert tracking.returncode == 0
+        assert tracking.stdout.strip()
+
+    def test_stale_branch_check_refuses_if_branch_changed(self, project_with_remote, repo_with_remote):
+        propose = build_git_push_tool(project_with_remote).execute({})
+        op = propose.pending_git_operation
+
+        run_git(repo_with_remote, "checkout", "-q", "-b", "some-other-branch")
+
+        result = apply_git_operation(op)
+        assert not result.ok
+        assert "changed since this push was proposed" in result.output.lower()
+
+    def test_remote_removed_before_apply_is_refused(self, project_with_remote, repo_with_remote):
+        propose = build_git_push_tool(project_with_remote).execute({})
+        op = propose.pending_git_operation
+
+        run_git(repo_with_remote, "remote", "remove", "origin")
+
+        result = apply_git_operation(op)
+        assert not result.ok
+
+    def test_rejected_non_fast_forward_push_reports_failure_cleanly(
+        self, project_with_remote, repo_with_remote, bare_remote
+    ):
+        # Establish the branch on the remote first.
+        propose1 = build_git_push_tool(project_with_remote).execute({})
+        branch = propose1.pending_git_operation.branch_name
+        assert apply_git_operation(propose1.pending_git_operation).ok
+
+        # Someone else pushes a commit we don't have, via a second clone.
+        clone_dir = repo_with_remote.parent / "clone2"
+        subprocess.run(["git", "clone", "-q", str(bare_remote), str(clone_dir)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "x@example.com"], cwd=str(clone_dir), check=True)
+        subprocess.run(["git", "config", "user.name", "X"], cwd=str(clone_dir), check=True)
+        (clone_dir / "other.txt").write_text("from elsewhere\n")
+        subprocess.run(["git", "add", "other.txt"], cwd=str(clone_dir), check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "diverging commit"], cwd=str(clone_dir), check=True)
+        subprocess.run(["git", "push", "-q", "origin", branch], cwd=str(clone_dir), check=True)
+
+        # A local-only commit now diverges from the remote.
+        (repo_with_remote / "local_only.txt").write_text("local\n")
+        run_git(repo_with_remote, "add", "local_only.txt")
+        run_git(repo_with_remote, "commit", "-q", "-m", "local-only commit")
+
+        propose2 = build_git_push_tool(project_with_remote).execute({})
+        result2 = apply_git_operation(propose2.pending_git_operation)
+
+        assert not result2.ok
+        assert "failed to push" in result2.output.lower()
+
+    def test_push_argv_never_contains_a_force_flag(self, project_with_remote):
+        """Checks the actual argv _run_git is called with for the push
+        step, not just source text (a comment mentioning "--force" to
+        document the guarantee would otherwise trip up a naive text scan)."""
+        import agent.tools.git as git_module
+
+        propose = build_git_push_tool(project_with_remote).execute({})
+        op = propose.pending_git_operation
+
+        seen_argvs = []
+        real_run_git = git_module._run_git
+
+        def spying_run_git(repo_root, args, timeout=git_module.GIT_SUBPROCESS_TIMEOUT):
+            seen_argvs.append(list(args))
+            return real_run_git(repo_root, args, timeout=timeout)
+
+        with mock.patch("agent.tools.git._run_git", side_effect=spying_run_git):
+            result = apply_git_operation(op)
+
+        assert result.ok
+        push_argvs = [argv for argv in seen_argvs if argv and argv[0] == "push"]
+        assert len(push_argvs) == 1
+        assert "--force" not in push_argvs[0]
+        assert "-f" not in push_argvs[0]
+
+
 class TestNoGenericGitCommandTool:
     """The most important Phase 5 security property: no tool exists that
     accepts an arbitrary Git command or subcommand string."""
 
-    def test_registry_only_exposes_the_six_narrow_git_tools(self):
+    def test_registry_only_exposes_the_seven_narrow_git_tools(self):
+        """git_push (added after this test was first written) is still one
+        more narrow, single-purpose tool -- not a generic executor. It can
+        only push the currently checked-out branch to an already-configured
+        remote, never force, never an arbitrary refspec."""
         import inspect
 
         import agent.tools.git as git_module
@@ -418,6 +661,7 @@ class TestNoGenericGitCommandTool:
             "build_git_create_branch_tool",
             "build_git_stage_tool",
             "build_git_commit_tool",
+            "build_git_push_tool",
         }
 
     def test_no_run_git_command_function_exists(self):

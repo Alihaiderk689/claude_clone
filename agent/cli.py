@@ -7,6 +7,7 @@ collects the user's approval for proposed file changes.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -15,12 +16,16 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
+from . import context_manager
 from .command_policy import ApprovedCommand
 from .diff import ProposedChange, unified_diff_text
 from .git_policy import ProposedGitOperation
+from .logging_config import configure_logging, debug_enabled_from_env, get_logger
 from .loop import MAX_TOOL_ITERATIONS, run_agent_turn
 from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient
+from .planner import Plan
 from .project import ProjectRoot
+from .task_state import TaskState
 from .tools import FileStateTracker, build_default_registry
 from .tools.terminal import CommandExecutionResult, describe_command
 
@@ -76,27 +81,40 @@ rather than repeating the same command unchanged.
 You are working inside a Git repository when Git is available — check with git_status if you're \
 not sure. You can inspect Git state freely and without approval using git_status, git_diff, and \
 git_log; none of them change anything. You can request controlled Git modifications using \
-git_create_branch, git_stage, and git_commit — like editing and running commands, each of these \
-only proposes the operation, and the user is shown exactly what would happen and must approve it \
-before anything changes. Before proposing a commit, inspect the staged diff with \
+git_create_branch, git_stage, git_commit, and git_push — like editing and running commands, each \
+of these only proposes the operation, and the user is shown exactly what would happen and must \
+approve it before anything changes. Before proposing a commit, inspect the staged diff with \
 git_diff(staged=true) so you actually know what you're committing, and stage files with git_stage \
 first if nothing (or the wrong thing) is staged yet. If the user asks you to fix something and \
 commit it, still show the diff, the files to stage, and the proposed commit message, and get \
-approval at each step — never skip straight to committing because the user said to.
+approval at each step — never skip straight to committing because the user said to. git_push only \
+ever pushes the branch that's currently checked out to an already-configured remote (default \
+'origin') with a plain, non-force push — it cannot check out a different branch first, cannot add \
+a new remote, and cannot force-push; if a push is rejected (e.g. the remote has commits you don't \
+have locally), report that plainly rather than trying to work around it.
 
-Never claim a branch was created, files were staged, or a commit was made until the tool result \
-confirms the user approved it and it succeeded. Never use Git to discard the user's existing work: \
-this agent has no reset, clean, checkout/restore-to-discard, rebase, merge, force-push, or branch \
--D capability, and you must not try to improvise one — if the working tree has unrelated \
-modifications, leave them alone and only stage/commit what the user actually asked for. If \
-git_status shows changes you didn't expect, inspect them with git_diff before doing anything else \
-instead of assuming they're safe to override.
+Never claim a branch was created, files were staged, a commit was made, or a push succeeded until \
+the tool result confirms the user approved it and it succeeded. Never use Git to discard the \
+user's existing work: this agent has no reset, clean, checkout/restore-to-discard, rebase, merge, \
+force-push, or branch -D capability, and you must not try to improvise one — if the working tree \
+has unrelated modifications, leave them alone and only stage/commit what the user actually asked \
+for. If git_status shows changes you didn't expect, inspect them with git_diff before doing \
+anything else instead of assuming they're safe to override.
 
-Neither editing, running commands, nor Git modifications happen automatically — in all three \
-cases, never claim an action completed until the tool result confirms the user approved it and it \
-succeeded. A pending or rejected proposal is not a completed action. This agent cannot push to a \
-remote — that capability does not exist yet. Only mention a limitation if the user actually asks \
-for something it covers; do not bring it up otherwise.
+Neither editing, running commands, nor Git modifications (including pushing) happen automatically \
+— in every case, never claim an action completed until the tool result confirms the user approved \
+it and it succeeded. A pending or rejected proposal is not a completed action. Only mention a \
+limitation if the user actually asks for something it covers; do not bring it up otherwise.
+
+For multi-step tasks that genuinely span several files or concerns (e.g. "add JWT authentication", \
+"add password reset functionality"), call create_plan first with a short goal and a handful of \
+concrete steps, before making any changes — the user is shown the plan and asked to proceed. For \
+small, single-action requests (e.g. "rename this variable", "change this button text"), skip \
+create_plan and just do it directly. Once a plan is approved, mark a step in_progress before \
+working on it and completed only once it is genuinely done — verified (e.g. tests passing), not \
+just edited — using update_plan; use blocked or failed with a short note if you cannot continue a \
+step rather than claiming success. A plan is not permission to skip approvals: every file edit, \
+command, and Git operation still needs its own separate approval exactly as before.
 
 Never claim to have inspected a file or directory you have not actually called a tool on. If a \
 tool call fails or turns up nothing useful, say so instead of making something up."""
@@ -196,7 +214,9 @@ def render_command_result(console: Console, result: CommandExecutionResult) -> N
     """Print a capped summary for the human. The model receives the fuller
     (still truncated, see terminal.py) text separately via the tool result.
     """
-    if result.timed_out:
+    if result.cancelled:
+        console.print("[yellow]Command was cancelled and terminated.[/yellow]")
+    elif result.timed_out:
         console.print("[yellow]Command timed out and was terminated.[/yellow]")
     elif result.exit_code == 0:
         console.print("[green]Command finished (exit code 0).[/green]")
@@ -259,10 +279,57 @@ def _handle_git_confirm(console: Console, op: ProposedGitOperation) -> bool:
         console.print()
         return _ask_git_approval(console, escape("Create this commit? [y/N]:"))
 
+    if op.kind == "push":
+        console.print("\n[bold]Agent wants to push:[/bold]\n")
+        destination = f"{op.remote} ({op.remote_url})" if op.remote_url else op.remote
+        console.print(f"  Branch:      {escape(op.branch_name)}")
+        console.print(f"  Remote:      {escape(destination)}\n")
+        console.print("[bold]Commits to be pushed:[/bold]")
+        for line in (op.commits_preview or "").splitlines():
+            console.print(f"  {escape(line)}")
+        console.print()
+        return _ask_git_approval(console, escape("Push to the remote? [y/N]:"))
+
     return False  # pragma: no cover - unknown kind, safe default
 
 
-def render_turn(console: Console, client: OllamaClient, registry, messages: list, tracker) -> None:
+def render_plan(console: Console, plan: Plan) -> None:
+    console.print("\n[bold]I'll handle this in the following steps:[/bold]\n")
+    for line in plan.render_lines():
+        console.print(f"  {escape(line)}")
+    console.print()
+
+
+def render_plan_progress(console: Console, task_state: TaskState) -> None:
+    if task_state.plan is None:
+        return
+    console.print("\n[bold]Plan:[/bold]\n")
+    for line in task_state.plan.render_lines():
+        console.print(f"  {escape(line)}")
+    console.print()
+    if task_state.plan.is_complete():
+        console.print("[bold green]✓ All plan steps are complete.[/bold green]\n")
+    elif task_state.plan.is_blocked():
+        console.print("[bold yellow]⚠ Task blocked — see the step above for the reason.[/bold yellow]\n")
+
+
+def _ask_plan_approval(console: Console) -> bool:
+    """Unlike every other approval prompt in this app, a bare Enter here
+    means yes. A plan has no side effects of its own to guard against —
+    approving it is not permission to skip the separate, default-reject
+    approval every actual file edit, command, or Git operation still needs.
+    Only an explicit n/no rejects it.
+    """
+    raw = console.input(f"{escape('Proceed? [Y/n]:')} ").strip().lower()
+    return raw not in ("n", "no")
+
+
+def _handle_plan_confirm(console: Console, plan: Plan) -> bool:
+    render_plan(console, plan)
+    return _ask_plan_approval(console)
+
+
+def render_turn(console: Console, client: OllamaClient, registry, messages: list, tracker, task_state) -> None:
     """Consume one agent turn's events and render them to the terminal.
 
     Each model round-trip is fully buffered before it's shown (see loop.py
@@ -276,7 +343,9 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
     prefix_printed = False
     turn_state = {"approve_all": False}
 
-    gen = run_agent_turn(client, registry, messages, tracker=tracker, max_iterations=MAX_TOOL_ITERATIONS)
+    gen = run_agent_turn(
+        client, registry, messages, tracker=tracker, task_state=task_state, max_iterations=MAX_TOOL_ITERATIONS
+    )
 
     with console.status("[dim]Agent is thinking...[/dim]", spinner="dots") as status:
         send_value = None
@@ -294,10 +363,19 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
                     console.print("[dim]Agent is inspecting the project...[/dim]\n")
                     inspecting_announced = True
                 console.print(f"  [dim]→[/dim] {escape(event['display'])}")
+                if event["name"] == "update_plan" and task_state.plan is not None:
+                    render_plan_progress(console, task_state)
                 status.start()
 
             elif etype == "tool_error":
                 console.print(f"    [red]! {escape(event['message'])}[/red]")
+
+            elif etype == "repetition_detected":
+                console.print(
+                    f"    [yellow]! Repeated {escape(event['name'])} call "
+                    f"{event['count']} times without progress -- asked the agent to change "
+                    "approach.[/yellow]"
+                )
 
             elif etype == "confirm":
                 status.stop()
@@ -345,6 +423,21 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
             elif etype == "git_operation_rejected":
                 console.print("[yellow]✗ Git operation not performed. Nothing was changed.[/yellow]\n")
 
+            elif etype == "confirm_plan":
+                status.stop()
+                if not inspecting_announced:
+                    console.print("[dim]Agent is inspecting the project...[/dim]\n")
+                    inspecting_announced = True
+                send_value = _handle_plan_confirm(console, event["plan"])
+                status.start()
+
+            elif etype == "plan_approved":
+                console.print("[green]✓ Plan approved.[/green]")
+                render_plan_progress(console, task_state)
+
+            elif etype == "plan_rejected":
+                console.print("[yellow]Plan not approved.[/yellow]\n")
+
             elif etype == "content":
                 status.stop()
                 if not prefix_printed:
@@ -362,6 +455,16 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
                 console.print()
                 console.print()
 
+            elif etype == "retry":
+                console.print(
+                    f"[yellow]Connection to Ollama failed ({escape(event['reason'])}). "
+                    f"Retrying ({event['attempt']}/{event['max_attempts'] - 1})...[/yellow]"
+                )
+
+            elif etype == "cancelled":
+                status.stop()
+                console.print("\n[yellow]Task stopped.[/yellow]")
+
             elif etype == "error":
                 status.stop()
                 console.print(f"\n[bold red]Ollama error:[/bold red] {escape(event['message'])}")
@@ -374,7 +477,62 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
                 )
 
 
+NEW_TASK_COMMANDS = {"/new"}
+
+
+def _fresh_session_state(project: ProjectRoot, project_root_path: Path):
+    """Builds a brand-new tracker/task_state/registry/messages set -- used
+    both for the initial session and for /new, so the two can never drift
+    apart. Nothing here touches project files or Git history; it only
+    resets in-memory state for this process.
+    """
+    tracker = FileStateTracker()
+    task_state = TaskState()
+    registry = build_default_registry(project, tracker, task_state)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE.format(project_root=project_root_path)}
+    ]
+    return tracker, task_state, registry, messages
+
+
+def _run_serve_command(argv: list, debug: bool) -> None:
+    """Handle `code-agent serve` -- starts the local HTTP server that the
+    VS Code extension talks to (see agent/server.py). Deferred import so
+    the ordinary interactive CLI path never pays for importing the server
+    module, and to avoid a circular import (server.py imports
+    _fresh_session_state from this module). `debug` is decided once by
+    main() (a bare --debug works before or after "serve") rather than
+    parsed twice.
+    """
+    parser = argparse.ArgumentParser(prog="code-agent serve")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port to bind on 127.0.0.1 (default 8765, falls back to an OS-assigned port if busy).",
+    )
+    args = parser.parse_args(argv)
+
+    configure_logging(debug=debug or debug_enabled_from_env())
+
+    from .server import DEFAULT_PORT, run_server
+
+    run_server(port=args.port if args.port is not None else DEFAULT_PORT)
+
+
 def main() -> None:
+    debug = "--debug" in sys.argv
+    if debug:
+        sys.argv = [a for a in sys.argv if a != "--debug"]
+
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        _run_serve_command(sys.argv[2:], debug=debug)
+        return
+
+    configure_logging(debug=debug or debug_enabled_from_env())
+    logger = get_logger("cli")
+    logger.debug("Starting interactive CLI session.")
+
     console = Console()
 
     host = os.environ.get("OLLAMA_HOST", DEFAULT_HOST)
@@ -383,8 +541,7 @@ def main() -> None:
 
     client = OllamaClient(host=host, model=model)
     project = ProjectRoot(project_root_path)
-    tracker = FileStateTracker()
-    registry = build_default_registry(project, tracker)
+    tracker, task_state, registry, messages = _fresh_session_state(project, project_root_path)
 
     console.print(build_banner(model, project_root_path))
     console.print()
@@ -395,10 +552,6 @@ def main() -> None:
             f"running at [cyan]{escape(host)}[/cyan] (start it with: [cyan]ollama serve[/cyan])."
         )
         sys.exit(1)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE.format(project_root=project_root_path)}
-    ]
 
     while True:
         try:
@@ -417,14 +570,22 @@ def main() -> None:
             console.print("[dim]Goodbye![/dim]")
             break
 
+        if user_input.lower() in NEW_TASK_COMMANDS:
+            tracker, task_state, registry, messages = _fresh_session_state(project, project_root_path)
+            console.print("[dim]Started a new task. Project files and Git history are untouched.[/dim]\n")
+            continue
+
         history_len_before = len(messages)
         messages.append({"role": "user", "content": user_input})
 
         try:
-            render_turn(console, client, registry, messages, tracker)
+            render_turn(console, client, registry, messages, tracker, task_state)
         except KeyboardInterrupt:
             console.print("\n[dim](response interrupted)[/dim]")
             del messages[history_len_before:]
+            if task_state.plan is not None:
+                console.print("\n[bold]Task paused.[/bold]")
+                render_plan_progress(console, task_state)
             continue
         except Exception as exc:  # pragma: no cover - last-resort safety net
             console.print(f"\n[bold red]Unexpected error:[/bold red] {escape(str(exc))}")

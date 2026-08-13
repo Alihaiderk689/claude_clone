@@ -54,8 +54,19 @@ def test_is_ignored_dir(project):
     assert not project.is_ignored_dir("src")
 
 
-def test_is_sensitive_matches_env_files(project):
-    assert project.is_sensitive(project.root / ".env")
-    assert project.is_sensitive(project.root / ".env.local")
+def test_is_sensitive_no_longer_matches_env_files(project):
+    """.env is deliberately NOT in is_sensitive() -- the agent is allowed
+    to create/edit .env directly (by request). It's still flagged
+    separately by looks_like_env_file(), used only for git.py's
+    stage-time warning -- see test_looks_like_env_file below."""
+    assert not project.is_sensitive(project.root / ".env")
+    assert not project.is_sensitive(project.root / ".env.local")
     assert project.is_sensitive(project.root / "id_rsa")
     assert not project.is_sensitive(project.root / "src" / "app.py")
+
+
+def test_looks_like_env_file(project):
+    assert project.looks_like_env_file(project.root / ".env")
+    assert project.looks_like_env_file(project.root / ".env.local")
+    assert not project.looks_like_env_file(project.root / "id_rsa")
+    assert not project.looks_like_env_file(project.root / "src" / "app.py")

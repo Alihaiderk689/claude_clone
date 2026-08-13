@@ -3,11 +3,15 @@ carries the "already validated, not yet executed" data agent/tools/git.py
 needs to show the user and (if approved) actually perform.
 
 Read-only Git inspection (git_status/git_diff/git_log) doesn't need this --
-it can't modify anything. This module guards only the three state-changing
-operations: branch creation, staging, and committing. There is deliberately
-no way to run an arbitrary Git command through here or anywhere else --
-each operation gets its own narrow validator, the same way command_policy.py
+it can't modify anything. This module guards the state-changing operations:
+branch creation, staging, committing, and pushing. There is deliberately no
+way to run an arbitrary Git command through here or anywhere else -- each
+operation gets its own narrow validator, the same way command_policy.py
 allowlists specific programs instead of trusting an arbitrary string.
+`validate_remote_name` below only checks the *name* is well-formed; whether
+it's actually a remote configured in this repo is checked in
+agent/tools/git.py against real `git remote` output, since that requires a
+subprocess call this module doesn't otherwise make for format-only checks.
 """
 from __future__ import annotations
 
@@ -28,6 +32,11 @@ GIT_SUBPROCESS_TIMEOUT = 15
 # is the authoritative second check in validate_branch_name below.
 _BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
+# Remote names are much simpler than ref names in practice ("origin",
+# "upstream", ...) -- no "/" needed, kept stricter than Git technically
+# allows on purpose.
+_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 # Same rationale as command_policy.py: subprocess never uses shell=True, so
 # none of these can actually trigger shell parsing. Checked anyway as
 # defense in depth for branch names and paths, which Git itself parses
@@ -47,7 +56,7 @@ class ProposedGitOperation:
     after the user has explicitly approved it.
     """
 
-    kind: str  # "create_branch" | "stage" | "commit"
+    kind: str  # "create_branch" | "stage" | "commit" | "push"
     repo_root: Path
     branch_name: Optional[str] = None
     paths: List[str] = field(default_factory=list)
@@ -57,6 +66,14 @@ class ProposedGitOperation:
     # so a commit can't silently fire against a staging area that changed
     # underneath it (see Phase 5 spec item 22).
     expected_staged_files: List[str] = field(default_factory=list)
+    # push only: the already-configured remote being pushed to, its URL (for
+    # display, so the user can see *where* this is going), and a best-effort
+    # preview of the commits that would be sent -- re-checked at apply time
+    # the same way expected_staged_files is, so a push can't silently fire
+    # against a branch that moved since it was proposed.
+    remote: Optional[str] = None
+    remote_url: Optional[str] = None
+    commits_preview: Optional[str] = None
 
 
 def _contains_shell_metacharacters(token: str) -> bool:
@@ -122,6 +139,27 @@ def validate_stage_paths(project: ProjectRoot, paths: List[str]) -> List[str]:
         relative_paths.append(str(resolved.relative_to(project.root)))
 
     return relative_paths
+
+
+def validate_remote_name(name: str) -> str:
+    """Format-only validation -- confirming `name` is actually a remote
+    configured in this repo (not one the model invented) happens in
+    agent/tools/git.py, against real `git remote` output."""
+    name = (name or "").strip()
+    if not name:
+        raise GitPolicyError("Remote name must not be empty.")
+    if name.startswith("-"):
+        raise GitPolicyError(
+            f"Remote name {name!r} must not start with '-' (Git could parse it as a flag)."
+        )
+    if _contains_shell_metacharacters(name):
+        raise GitPolicyError(f"Remote name {name!r} contains disallowed characters.")
+    if not _REMOTE_NAME_RE.match(name):
+        raise GitPolicyError(
+            f"Remote name {name!r} is not a valid Git remote name (use letters, numbers, '.', "
+            "'_', '-', starting with a letter or number)."
+        )
+    return name
 
 
 def validate_commit_message(message: str) -> str:

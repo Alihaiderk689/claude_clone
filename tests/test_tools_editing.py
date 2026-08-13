@@ -32,6 +32,7 @@ def sample_project(tmp_path):
     )
     (tmp_path / "backend" / "dup.py").write_text("x = 1\nx = 1\n")
     (tmp_path / ".env").write_text("SECRET=shh\n")
+    (tmp_path / "id_rsa").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nshh\n")
     return tmp_path
 
 
@@ -101,9 +102,19 @@ class TestEditFilePropose:
         assert "access denied" in result.output.lower()
 
     def test_sensitive_file_rejected(self, edit_tool):
-        result = edit_tool.execute({"path": ".env", "old_text": "SECRET=shh", "new_text": "SECRET=x"})
+        result = edit_tool.execute(
+            {"path": "id_rsa", "old_text": "shh", "new_text": "different"}
+        )
         assert not result.ok
         assert "sensitive" in result.output.lower()
+
+    def test_env_file_is_allowed(self, edit_tool):
+        """.env is deliberately not treated as sensitive for editing (by
+        request) -- unlike id_rsa/*.pem/etc above, it can be created and
+        edited directly. See agent/project.py's ENV_FILE_PATTERNS."""
+        result = edit_tool.execute({"path": ".env", "old_text": "SECRET=shh", "new_text": "SECRET=x"})
+        assert result.ok
+        assert result.pending_change is not None
 
     def test_directory_target_rejected(self, edit_tool):
         result = edit_tool.execute({"path": "backend", "old_text": "x", "new_text": "y"})
@@ -186,6 +197,11 @@ class TestWriteFilePropose:
         result = write_tool.execute({"path": "backend/id_rsa", "content": "fake key"})
         assert not result.ok
         assert "sensitive" in result.output.lower()
+
+    def test_new_env_file_is_allowed(self, write_tool):
+        result = write_tool.execute({"path": "backend/.env", "content": "API_KEY=x\n"})
+        assert result.ok
+        assert result.pending_change is not None
 
     def test_directory_target_rejected(self, write_tool):
         result = write_tool.execute({"path": "backend", "content": "x"})

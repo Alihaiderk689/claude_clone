@@ -1,19 +1,24 @@
 """Git awareness and controlled Git operations.
 
 Read-only inspection (git_status, git_diff, git_log) works like any other
-read-only tool -- no approval needed since nothing is modified. The three
-state-changing tools (git_create_branch, git_stage, git_commit) follow the
-exact same propose/apply split as editing.py and terminal.py: run() only
-validates (via ../git_policy.py) and builds a ProposedGitOperation
-describing exactly what would happen; apply_git_operation() is the only
-thing that ever actually runs `git branch`, `git add`, or `git commit`, and
-it's only ever called by the agent loop after the user has explicitly
-approved.
+read-only tool -- no approval needed since nothing is modified. The
+state-changing tools (git_create_branch, git_stage, git_commit, git_push)
+follow the exact same propose/apply split as editing.py and terminal.py:
+run() only validates (via ../git_policy.py) and builds a
+ProposedGitOperation describing exactly what would happen;
+apply_git_operation() is the only thing that ever actually runs `git
+branch`, `git add`, `git commit`, or `git push`, and it's only ever called
+by the agent loop after the user has explicitly approved.
 
 There is deliberately no generic "run a git command" tool. Each operation
 is its own narrow, validated tool -- this is what keeps destructive Git
 commands (reset --hard, clean -fd, checkout/restore ., push --force, branch
 -D, rebase, merge, ...) permanently unreachable, not just discouraged.
+git_push specifically: only pushes the CURRENT branch (there's no checkout
+tool, so "current branch" is unambiguous) to an ALREADY-CONFIGURED remote
+(the model can't add one -- there's no git-remote-add tool either) with a
+plain `git push --set-upstream <remote> <branch>`. `--force`/`-f` is never
+passed and there is no argument path that could make it happen.
 """
 from __future__ import annotations
 
@@ -29,10 +34,11 @@ from ..git_policy import (
     ProposedGitOperation,
     validate_branch_name,
     validate_commit_message,
+    validate_remote_name,
     validate_stage_paths,
 )
 from ..project import PathSecurityError, ProjectRoot
-from .base import Tool, ToolError, ToolResult
+from .base import ExternalToolUnavailableError, Tool, ToolError, ToolResult, ToolTimeoutError
 
 MAX_LOG_ENTRIES = 20
 MAX_DIFF_CHARS = 8000
@@ -76,31 +82,70 @@ class GitCommitArgs(BaseModel):
     message: str = Field(description="Commit message.")
 
 
+class GitPushArgs(BaseModel):
+    remote: str = Field(
+        default="origin",
+        description="Name of an already-configured Git remote to push to, e.g. 'origin'.",
+    )
+
+
 def _minimal_env() -> dict:
     return {name: os.environ[name] for name in _SAFE_ENV_VARS if name in os.environ}
 
 
 def _run_git(repo_root: Path, args: List[str], timeout: int = GIT_SUBPROCESS_TIMEOUT) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=_minimal_env(),
-    )
-
-
-def is_git_repository(repo_root: Path) -> bool:
+    """Run a git subprocess. Never lets a raw OSError/TimeoutExpired escape
+    -- both are translated into classified ToolError subclasses so every
+    caller (the read-only tools, the propose-side mutating tools, AND
+    apply_git_operation, which is called directly from loop.py with no
+    Tool.execute() safety net around it) gets a controlled failure instead
+    of an uncaught exception mid-turn.
+    """
     try:
-        result = _run_git(repo_root, ["rev-parse", "--is-inside-work-tree"])
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_minimal_env(),
+        )
+    except FileNotFoundError as exc:
+        raise ExternalToolUnavailableError(
+            "git is not installed or not available on PATH."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ToolTimeoutError(f"git {' '.join(args)} exceeded its {timeout}s timeout.") from exc
+    except OSError as exc:
+        raise ExternalToolUnavailableError(f"Failed to run git: {exc}") from exc
+
+
+def _check_git_repository(repo_root: Path) -> bool:
+    """Like is_git_repository(), but lets a genuine ToolError (git
+    unavailable/timeout) propagate instead of collapsing it into a plain
+    False -- used everywhere a caller can do something more useful with a
+    *classified* failure than a generic "not a repository" message: both
+    _require_git_repo (below, used by every git_* tool) and
+    apply_git_operation (which has its own ToolError handling since it's
+    called directly from loop.py with no Tool.execute() safety net).
+    """
+    result = _run_git(repo_root, ["rev-parse", "--is-inside-work-tree"])
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def is_git_repository(repo_root: Path) -> bool:
+    """Safe, never-raises check -- swallows a git-unavailable/timeout
+    ToolError into a plain False. Used where the caller only wants a bool
+    and has no more specific handling to offer (e.g. deciding whether to
+    register Git tools at all)."""
+    try:
+        return _check_git_repository(repo_root)
+    except ToolError:
+        return False
+
+
 def _require_git_repo(repo_root: Path) -> None:
-    if not is_git_repository(repo_root):
+    if not _check_git_repository(repo_root):
         raise ToolError("This project is not a Git repository.")
 
 
@@ -256,7 +301,11 @@ def _git_stage(project: ProjectRoot, args: GitStageArgs) -> ToolResult:
     except GitPolicyError as exc:
         raise ToolError(str(exc)) from exc
 
-    sensitive = [p for p in relative_paths if project.is_sensitive(project.root / p)]
+    sensitive = [
+        p
+        for p in relative_paths
+        if project.is_sensitive(project.root / p) or project.looks_like_env_file(project.root / p)
+    ]
 
     op = ProposedGitOperation(
         kind="stage", repo_root=project.root, paths=relative_paths, sensitive_paths=sensitive
@@ -292,13 +341,91 @@ def _git_commit(project: ProjectRoot, args: GitCommitArgs) -> ToolResult:
     )
 
 
+def _configured_remotes(repo_root: Path) -> List[str]:
+    result = _run_git(repo_root, ["remote"])
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _remote_url(repo_root: Path, remote: str) -> Optional[str]:
+    result = _run_git(repo_root, ["remote", "get-url", remote])
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _commits_preview(repo_root: Path, remote: str, branch: str) -> str:
+    """Best-effort summary of what a push would actually send, shown in the
+    approval prompt so the user isn't approving blind. Falls back cleanly
+    if the remote branch doesn't exist yet (first push of a new branch)."""
+    ahead = _run_git(repo_root, ["log", f"{remote}/{branch}..{branch}", "--oneline", "-n", "20"])
+    if ahead.returncode == 0:
+        return ahead.stdout.strip() or "(no new commits -- already up to date with the remote)"
+    local = _run_git(repo_root, ["log", branch, "--oneline", "-n", "20"])
+    if local.returncode == 0 and local.stdout.strip():
+        return local.stdout.strip() + "\n(new branch on the remote)"
+    return "(nothing to push)"
+
+
+def _git_push(project: ProjectRoot, args: GitPushArgs) -> ToolResult:
+    _require_git_repo(project.root)
+    try:
+        remote = validate_remote_name(args.remote)
+    except GitPolicyError as exc:
+        raise ToolError(str(exc)) from exc
+
+    configured = _configured_remotes(project.root)
+    if remote not in configured:
+        available = ", ".join(configured) or "(none configured)"
+        raise ToolError(
+            f"Remote {remote!r} is not configured for this repository. Configured remotes: "
+            f"{available}. This agent cannot add a remote -- set one up with `git remote add` "
+            "yourself first."
+        )
+
+    branch, detached, _sha = _current_branch(project.root)
+    if detached or not branch:
+        raise ToolError(
+            "HEAD is detached (not on a branch). This agent cannot check out a branch, so there's "
+            "nothing unambiguous to push -- check out a branch yourself first."
+        )
+
+    op = ProposedGitOperation(
+        kind="push",
+        repo_root=project.root,
+        branch_name=branch,
+        remote=remote,
+        remote_url=_remote_url(project.root, remote),
+        commits_preview=_commits_preview(project.root, remote, branch),
+    )
+    return ToolResult(
+        ok=True,
+        output="(pending user approval)",
+        display=f"git_push(remote={remote!r}, branch={branch!r})",
+        pending_git_operation=op,
+    )
+
+
 def apply_git_operation(op: ProposedGitOperation) -> ToolResult:
     """Actually perform an approved Git operation. Only ever called by the
     agent loop after the user has explicitly approved -- never by a tool's
     run(). This is the only function in the codebase that ever runs
     `git branch`, `git add`, or `git commit`.
+
+    Unlike the propose-side tool functions above, this is called directly
+    from loop.py with no Tool.execute() safety net wrapping it -- so unlike
+    those, it must catch ToolError itself (git binary disappearing mid-
+    session, a hung git process) rather than letting it propagate, or a
+    single flaky git invocation would crash the whole agent turn instead of
+    reporting a normal tool failure.
     """
-    if not is_git_repository(op.repo_root):
+    try:
+        return _apply_git_operation(op)
+    except ToolError as exc:
+        return ToolResult(ok=False, output=str(exc), error_type=exc.error_type, recoverable=exc.recoverable)
+
+
+def _apply_git_operation(op: ProposedGitOperation) -> ToolResult:
+    if not _check_git_repository(op.repo_root):
         return ToolResult(
             ok=False, output="This project is not a Git repository anymore. Nothing was done."
         )
@@ -328,6 +455,8 @@ def apply_git_operation(op: ProposedGitOperation) -> ToolResult:
                     f"{sorted(op.expected_staged_files)}, found {current_files}). Refusing to "
                     "commit a stale proposal -- run git_status again and re-propose."
                 ),
+                error_type="StaleStateError",
+                recoverable=True,
             )
         result = _run_git(op.repo_root, ["commit", "-m", op.message])
         if result.returncode != 0:
@@ -335,6 +464,37 @@ def apply_git_operation(op: ProposedGitOperation) -> ToolResult:
         sha_result = _run_git(op.repo_root, ["rev-parse", "--short", "HEAD"])
         sha = sha_result.stdout.strip()
         return ToolResult(ok=True, output=f"Created commit {sha}: {op.message}")
+
+    if op.kind == "push":
+        current_branch, detached, _sha = _current_branch(op.repo_root)
+        if detached or current_branch != op.branch_name:
+            return ToolResult(
+                ok=False,
+                output=(
+                    f"The checked-out branch changed since this push was proposed (expected "
+                    f"{op.branch_name!r}, now on {current_branch!r}). Refusing to push a stale "
+                    "proposal -- run git_status again and re-propose."
+                ),
+                error_type="StaleStateError",
+                recoverable=True,
+            )
+        if op.remote not in _configured_remotes(op.repo_root):
+            return ToolResult(
+                ok=False,
+                output=f"Remote {op.remote!r} is no longer configured for this repository.",
+            )
+        # --set-upstream, never --force: this is the only invocation of
+        # `git push` anywhere in this codebase, and there is no argument
+        # path (here or in git_policy.py's validation) that can add -f.
+        result = _run_git(
+            op.repo_root, ["push", "--set-upstream", op.remote, op.branch_name], timeout=60
+        )
+        if result.returncode != 0:
+            return ToolResult(ok=False, output=f"Failed to push: {result.stderr.strip()[:500]}")
+        return ToolResult(
+            ok=True,
+            output=f"Pushed branch '{op.branch_name}' to remote '{op.remote}'.\n{result.stderr.strip()}",
+        )
 
     return ToolResult(ok=False, output=f"Unknown Git operation kind: {op.kind!r}")  # pragma: no cover
 
@@ -416,4 +576,21 @@ def build_git_commit_tool(project: ProjectRoot) -> Tool:
         ),
         args_model=GitCommitArgs,
         run=lambda args: _git_commit(project, args),
+    )
+
+
+def build_git_push_tool(project: ProjectRoot) -> Tool:
+    return Tool(
+        name="git_push",
+        description=(
+            "Propose pushing the current branch to an already-configured remote (default "
+            "'origin'). Only proposes it -- the user is shown the remote, the branch, and a "
+            "preview of the commits that would be sent, and must approve before anything is "
+            "pushed. This never force-pushes and cannot push a different branch than the one "
+            "currently checked out (there is no checkout tool). Fails clearly if the named "
+            "remote isn't configured, if HEAD is detached, or if the remote rejects the push "
+            "(e.g. it has commits you don't have locally) -- never retries automatically."
+        ),
+        args_model=GitPushArgs,
+        run=lambda args: _git_push(project, args),
     )

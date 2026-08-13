@@ -24,6 +24,7 @@ def sample_project(tmp_path):
     (tmp_path / "node_modules" / "pkg" / "index.js").write_text("// JWT mentioned here too\n")
 
     (tmp_path / ".env").write_text("JWT_SECRET=whatever\n")
+    (tmp_path / "id_rsa").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nJWT_SECRET too\n")
 
     return tmp_path
 
@@ -60,7 +61,12 @@ class TestSearchFallback:
     def test_skips_sensitive_files(self, search_tool):
         result = search_tool.execute({"query": "JWT_SECRET"})
         assert result.ok
-        assert ".env" not in result.output
+        assert "id_rsa" not in result.output
+
+    def test_does_not_skip_env_files(self, search_tool):
+        result = search_tool.execute({"query": "JWT_SECRET"})
+        assert result.ok
+        assert ".env" in result.output
 
     def test_respects_max_results(self, project):
         many_dir = project.root / "many"

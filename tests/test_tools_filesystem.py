@@ -1,6 +1,8 @@
 """Tests for the list_files and read_file tools."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from agent.project import MAX_FILE_SIZE_BYTES, ProjectRoot
@@ -9,6 +11,11 @@ from agent.tools.filesystem import (
     ReadFileArgs,
     build_list_files_tool,
     build_read_file_tool,
+)
+
+requires_non_root = pytest.mark.skipif(
+    hasattr(os, "getuid") and os.getuid() == 0,
+    reason="permission checks are bypassed when running as root",
 )
 
 
@@ -27,6 +34,7 @@ def sample_project(tmp_path):
     (tmp_path / ".git" / "config").write_text("[core]\n")
 
     (tmp_path / ".env").write_text("SECRET=supersecret\n")
+    (tmp_path / "id_rsa").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nshh\n")
 
     (tmp_path / "big.txt").write_text("x" * (MAX_FILE_SIZE_BYTES + 1))
     (tmp_path / "binary.dat").write_bytes(bytes(range(256)) * 4)
@@ -65,7 +73,13 @@ class TestListFiles:
 
     def test_hides_sensitive_files_from_listing(self, list_files_tool):
         result = list_files_tool.execute({"path": "."})
-        assert ".env" not in result.output
+        assert "id_rsa" not in result.output
+
+    def test_env_file_is_not_hidden(self, list_files_tool):
+        """.env is deliberately not treated as sensitive (by request) --
+        see agent/project.py's ENV_FILE_PATTERNS."""
+        result = list_files_tool.execute({"path": "."})
+        assert ".env" in result.output
 
     def test_lists_subdirectory(self, list_files_tool):
         result = list_files_tool.execute({"path": "backend/accounts"})
@@ -136,9 +150,13 @@ class TestReadFile:
         assert result.ok
 
     def test_rejects_sensitive_file(self, read_file_tool):
-        result = read_file_tool.execute({"path": ".env"})
+        result = read_file_tool.execute({"path": "id_rsa"})
         assert not result.ok
         assert "sensitive" in result.output.lower()
+
+    def test_env_file_is_readable(self, read_file_tool):
+        result = read_file_tool.execute({"path": ".env"})
+        assert result.ok
 
     def test_rejects_path_traversal(self, read_file_tool):
         result = read_file_tool.execute({"path": "../../etc/passwd"})
@@ -153,3 +171,41 @@ class TestReadFile:
     def test_invalid_arguments_are_rejected(self, read_file_tool):
         result = read_file_tool.execute({})
         assert not result.ok
+
+    def test_not_found_is_classified(self, read_file_tool):
+        result = read_file_tool.execute({"path": "does_not_exist.py"})
+        assert not result.ok
+        assert result.error_type == "NotFoundError"
+        assert result.recoverable is True
+
+    @requires_non_root
+    def test_permission_denied_is_classified_not_crashed(self, sample_project, read_file_tool):
+        target = sample_project / "README.md"
+        target.chmod(0o000)
+        try:
+            result = read_file_tool.execute({"path": "README.md"})
+        finally:
+            target.chmod(0o644)  # restore so tmp_path cleanup can remove it
+
+        assert not result.ok  # must not raise
+        assert result.error_type == "PermissionError"
+        assert result.recoverable is False
+        assert "permission" in result.output.lower()
+
+
+class TestListFilesPermissionError:
+    @requires_non_root
+    def test_permission_denied_directory_is_classified_not_crashed(self, tmp_path):
+        (tmp_path / "locked").mkdir()
+        (tmp_path / "locked" / "secret.txt").write_text("x\n")
+        (tmp_path / "locked").chmod(0o000)
+        project = ProjectRoot(tmp_path)
+        tool = build_list_files_tool(project)
+
+        try:
+            result = tool.execute({"path": "locked"})
+        finally:
+            (tmp_path / "locked").chmod(0o755)
+
+        assert not result.ok  # must not raise
+        assert result.error_type == "PermissionError"

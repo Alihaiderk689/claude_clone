@@ -29,8 +29,6 @@ DEFAULT_IGNORED_DIRS: Set[str] = {
 }
 
 DEFAULT_SENSITIVE_PATTERNS = [
-    ".env",
-    ".env.*",
     "*.pem",
     "*.key",
     "id_rsa",
@@ -41,6 +39,16 @@ DEFAULT_SENSITIVE_PATTERNS = [
     "secrets.*",
     "*.sqlite3",
 ]
+
+# .env files are deliberately NOT in DEFAULT_SENSITIVE_PATTERNS -- by
+# request, the agent is allowed to create/edit them directly (e.g. "make
+# the API and put the secrets in .env"). They're kept here, checked
+# separately, only for git.py's stage-time warning: accidentally
+# `git add`-ing a real .env into a commit (and potentially a public
+# remote) is a much harder mistake to undo than the agent merely being
+# able to write the file locally, so that specific safety net stays on
+# even though direct editing no longer requires it.
+ENV_FILE_PATTERNS = [".env", ".env.*"]
 
 # Kept small and CPU/RAM-friendly for an 8GB machine running a 7B model locally.
 MAX_FILE_SIZE_BYTES = 200_000
@@ -101,3 +109,10 @@ class ProjectRoot:
     def is_sensitive(self, path: Path) -> bool:
         name = path.name
         return any(fnmatch.fnmatch(name, pattern) for pattern in self.sensitive_patterns)
+
+    def looks_like_env_file(self, path: Path) -> bool:
+        """True for .env/.env.* regardless of whether .env is in this
+        instance's sensitive_patterns -- used only by git.py's git_stage
+        warning (see ENV_FILE_PATTERNS above), never by read/write/edit."""
+        name = path.name
+        return any(fnmatch.fnmatch(name, pattern) for pattern in ENV_FILE_PATTERNS)

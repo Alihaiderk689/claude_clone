@@ -1,0 +1,80 @@
+{
+  "name": "local-coding-assistant",
+  "displayName": "Local Coding Assistant",
+  "description": "VS Code UI for the local, free, Claude Code-style coding assistant (Python agent + Ollama). Not published to the Marketplace -- install locally from a .vsix.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeAgent.openChat",
+        "title": "Local Coding Assistant: Open Chat"
+      },
+      {
+        "command": "codeAgent.explainSelection",
+        "title": "Local Coding Assistant: Explain Selection"
+      },
+      {
+        "command": "codeAgent.fixSelection",
+        "title": "Local Coding Assistant: Fix Selection"
+      },
+      {
+        "command": "codeAgent.askAboutSelection",
+        "title": "Ask Local Coding Assistant"
+      },
+      {
+        "command": "codeAgent.stopTask",
+        "title": "Local Coding Assistant: Stop Task"
+      },
+      {
+        "command": "codeAgent.newTask",
+        "title": "Local Coding Assistant: New Task"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codeAgent.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "9_cutcopypaste"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codeAgent.explainSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "codeAgent.fixSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "codeAgent.askAboutSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "pretest": "npm run compile",
+    "test": "node --test ./out/test/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

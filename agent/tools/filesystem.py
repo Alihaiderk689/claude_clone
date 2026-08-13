@@ -20,7 +20,7 @@ from ..project import (
     PathSecurityError,
     ProjectRoot,
 )
-from .base import Tool, ToolError, ToolResult
+from .base import NotFoundError, PermissionDeniedError, Tool, ToolError, ToolResult
 from .state import FileStateTracker
 
 
@@ -57,39 +57,54 @@ def _safe_resolve(project: ProjectRoot, path: str) -> Path:
 def _list_files(project: ProjectRoot, args: ListFilesArgs) -> ToolResult:
     target = _safe_resolve(project, args.path)
 
-    if not target.exists():
-        raise ToolError(f"Path not found: '{args.path}'")
+    try:
+        exists = target.exists()
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
+    if not exists:
+        raise NotFoundError(f"Path not found: '{args.path}'")
     if not target.is_dir():
         raise ToolError(f"'{args.path}' is a file, not a directory. Use read_file instead.")
 
     entries: List[str] = []
     truncated = False
 
-    for current_root, dirnames, filenames in os.walk(target):
-        dirnames[:] = sorted(d for d in dirnames if not project.is_ignored_dir(d))
-        filenames = sorted(filenames)
+    def _reraise(err: OSError) -> None:
+        # os.walk's default onerror=None silently skips a directory it
+        # can't scan (e.g. permission denied), which would otherwise make
+        # list_files lie and report a locked directory as merely empty --
+        # actively hiding the real problem from the model instead of
+        # reporting it. Re-raise so the except clause below handles it.
+        raise err
 
-        rel_dir = Path(current_root).relative_to(project.root)
+    try:
+        for current_root, dirnames, filenames in os.walk(target, onerror=_reraise):
+            dirnames[:] = sorted(d for d in dirnames if not project.is_ignored_dir(d))
+            filenames = sorted(filenames)
 
-        for d in dirnames:
-            if len(entries) >= args.max_entries:
-                truncated = True
+            rel_dir = Path(current_root).relative_to(project.root)
+
+            for d in dirnames:
+                if len(entries) >= args.max_entries:
+                    truncated = True
+                    break
+                rel = d if rel_dir == Path(".") else str(rel_dir / d)
+                entries.append(rel + "/")
+            if truncated:
                 break
-            rel = d if rel_dir == Path(".") else str(rel_dir / d)
-            entries.append(rel + "/")
-        if truncated:
-            break
 
-        for f in filenames:
-            if project.is_sensitive(Path(f)):
-                continue
-            if len(entries) >= args.max_entries:
-                truncated = True
+            for f in filenames:
+                if project.is_sensitive(Path(f)):
+                    continue
+                if len(entries) >= args.max_entries:
+                    truncated = True
+                    break
+                rel = f if rel_dir == Path(".") else str(rel_dir / f)
+                entries.append(rel)
+            if truncated:
                 break
-            rel = f if rel_dir == Path(".") else str(rel_dir / f)
-            entries.append(rel)
-        if truncated:
-            break
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied listing '{args.path}': {exc}") from exc
 
     output = "\n".join(entries) if entries else "(empty directory)"
     if truncated:
@@ -106,17 +121,24 @@ def _read_file(
 ) -> ToolResult:
     target = _safe_resolve(project, args.path)
 
-    if not target.exists():
-        raise ToolError(f"File not found: '{args.path}'")
+    try:
+        exists = target.exists()
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
+    if not exists:
+        raise NotFoundError(f"File not found: '{args.path}'")
     if target.is_dir():
         raise ToolError(f"'{args.path}' is a directory, not a file. Use list_files instead.")
     if project.is_sensitive(target):
-        raise ToolError(f"Refusing to read '{args.path}': it matches a sensitive-file pattern.")
+        raise PermissionDeniedError(f"Refusing to read '{args.path}': it matches a sensitive-file pattern.")
 
     if args.start_line is not None and args.end_line is not None and args.end_line < args.start_line:
         raise ToolError("end_line must be greater than or equal to start_line.")
 
-    size = target.stat().st_size
+    try:
+        size = target.stat().st_size
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
     if size > HARD_MAX_FILE_SIZE_BYTES:
         raise ToolError(
             f"'{args.path}' is {size:,} bytes, far too large to read even with a line range."
@@ -133,6 +155,8 @@ def _read_file(
         text = target.read_text(encoding="utf-8")
     except (UnicodeDecodeError, ValueError):
         raise ToolError(f"'{args.path}' looks like a binary file and can't be displayed as text.")
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied reading '{args.path}': {exc}") from exc
 
     # Record against the full content regardless of range, so a later
     # edit_file call can detect drift anywhere in the file, not just in

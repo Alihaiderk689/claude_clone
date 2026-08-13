@@ -9,9 +9,12 @@ from unittest import mock
 
 import pytest
 
+import threading
+
 from agent.loop import run_agent_turn
-from agent.ollama_client import OllamaClient, OllamaConnectionError
+from agent.ollama_client import OllamaCancelledError, OllamaClient, OllamaConnectionError
 from agent.project import ProjectRoot
+from agent.task_state import TaskState
 from agent.tools import FileStateTracker, build_default_registry
 from agent.tools.base import Tool, ToolResult
 from agent.tools.registry import ToolRegistry
@@ -23,7 +26,7 @@ def updates(*items):
         yield {"content": content, "tool_calls": tool_calls, "done": done}
 
 
-_CONFIRMATION_EVENT_TYPES = {"confirm", "confirm_command", "confirm_git_operation"}
+_CONFIRMATION_EVENT_TYPES = {"confirm", "confirm_command", "confirm_git_operation", "confirm_plan"}
 
 
 def drive_agent_turn(gen, decisions=()):
@@ -52,8 +55,13 @@ def project(tmp_path):
 
 
 @pytest.fixture
-def registry(project):
-    return build_default_registry(project)
+def task_state():
+    return TaskState()
+
+
+@pytest.fixture
+def registry(project, task_state):
+    return build_default_registry(project, task_state=task_state)
 
 
 class TestPlainAnswerNoTools:
@@ -313,7 +321,15 @@ class TestSafetyLimits:
         assert events[-1]["type"] == "max_iterations"
         assert not any(e["type"] == "final" for e in events)
 
-    def test_connection_error_yields_error_event_and_stops(self, registry):
+    def test_connection_error_retries_then_yields_error_event_and_stops(self, registry, monkeypatch):
+        """A connection error is transient -- Phase 8 retries it
+        MAX_OLLAMA_RETRIES times (see loop.py's retry policy) before giving
+        up, rather than failing on the very first attempt as earlier phases
+        did. Zero out the backoff so the test doesn't actually sleep."""
+        import agent.loop as loop_module
+
+        monkeypatch.setattr(loop_module, "OLLAMA_RETRY_BACKOFF_SECONDS", (0, 0))
+
         client = mock.create_autospec(OllamaClient, instance=True)
 
         def raise_connection_error(*_args, **_kwargs):
@@ -325,9 +341,131 @@ class TestSafetyLimits:
         messages = [{"role": "user", "content": "hi"}]
         events = list(run_agent_turn(client, registry, messages))
 
-        assert len(events) == 1
-        assert events[0]["type"] == "error"
-        assert "could not connect" in events[0]["message"].lower()
+        retry_events = [e for e in events if e["type"] == "retry"]
+        assert len(retry_events) == loop_module.MAX_OLLAMA_RETRIES
+        assert [e["attempt"] for e in retry_events] == [1, 2]
+        assert all(e["max_attempts"] == loop_module.MAX_OLLAMA_RETRIES + 1 for e in retry_events)
+
+        assert events[-1]["type"] == "error"
+        assert "could not connect" in events[-1]["message"].lower()
+        assert client.chat.call_count == loop_module.MAX_OLLAMA_RETRIES + 1
+
+    def test_connection_error_succeeds_after_one_retry(self, registry, monkeypatch):
+        import agent.loop as loop_module
+
+        monkeypatch.setattr(loop_module, "OLLAMA_RETRY_BACKOFF_SECONDS", (0, 0))
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+        attempts = {"n": 0}
+
+        def flaky_then_ok(*_args, **_kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise OllamaConnectionError("Could not connect to Ollama.")
+            return updates(("All good.", None, True))
+
+        client.chat.side_effect = flaky_then_ok
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages))
+
+        assert [e["type"] for e in events if e["type"] in ("retry", "final")] == ["retry", "final"]
+        assert events[-1]["text"] == "All good."
+        assert client.chat.call_count == 2
+
+    def test_timeout_error_is_also_retried(self, registry, monkeypatch):
+        import agent.loop as loop_module
+        from agent.ollama_client import OllamaTimeoutError
+
+        monkeypatch.setattr(loop_module, "OLLAMA_RETRY_BACKOFF_SECONDS", (0, 0))
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        def raise_timeout(*_args, **_kwargs):
+            raise OllamaTimeoutError("Connection to Ollama timed out.")
+            yield  # pragma: no cover
+
+        client.chat.side_effect = raise_timeout
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages))
+
+        assert any(e["type"] == "retry" for e in events)
+        assert events[-1]["type"] == "error"
+
+    def test_model_not_found_is_not_retried(self, registry):
+        """Retrying an identical request after a model-not-found or a
+        malformed-request-shaped API error would just fail identically --
+        these fail immediately, unlike connection/timeout errors."""
+        from agent.ollama_client import OllamaModelNotFoundError
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        def raise_model_not_found(*_args, **_kwargs):
+            raise OllamaModelNotFoundError("Model 'x' was not found.")
+            yield  # pragma: no cover
+
+        client.chat.side_effect = raise_model_not_found
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages))
+
+        assert events == [{"type": "error", "message": "Model 'x' was not found."}]
+        assert client.chat.call_count == 1
+
+    def test_api_error_is_not_retried(self, registry):
+        from agent.ollama_client import OllamaAPIError
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        def raise_api_error(*_args, **_kwargs):
+            raise OllamaAPIError("Ollama returned an error: bad request")
+            yield  # pragma: no cover
+
+        client.chat.side_effect = raise_api_error
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages))
+
+        assert events[-1]["type"] == "error"
+        assert client.chat.call_count == 1
+
+    def test_cancellation_during_retry_backoff_stops_cleanly(self, registry, monkeypatch):
+        """Stop Task must remain responsive even while the loop is asleep
+        between retry attempts, not just between whole model calls."""
+        import threading
+
+        import agent.loop as loop_module
+
+        monkeypatch.setattr(loop_module, "OLLAMA_RETRY_BACKOFF_SECONDS", (0.05, 0.05))
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        def raise_connection_error(*_args, **_kwargs):
+            raise OllamaConnectionError("Could not connect to Ollama.")
+            yield  # pragma: no cover
+
+        client.chat.side_effect = raise_connection_error
+
+        cancel_event = threading.Event()
+
+        def cancel_soon():
+            cancel_event.set()
+
+        # Trigger cancellation from inside the fake sleep so it lands
+        # squarely inside the retry backoff window.
+        real_sleep = loop_module._interruptible_sleep
+
+        def sleep_and_cancel(seconds, event):
+            cancel_soon()
+            return real_sleep(seconds, event)
+
+        monkeypatch.setattr(loop_module, "_interruptible_sleep", sleep_and_cancel)
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages, cancel_event=cancel_event))
+
+        assert events[-1] == {"type": "cancelled"}
 
 
 class TestReadOnlyToolsCannotEscapeProjectRoot:
@@ -546,11 +684,22 @@ class TestApprovalFlow:
         assert "changed on disk" in tool_error_events[0]["message"].lower()
 
 
+def _fake_terminal_proc(returncode=0, stdout="", stderr="", pid=99999):
+    """Stand-in for subprocess.Popen used by agent/tools/terminal.py's
+    execute_command -- .communicate() returns immediately, no real process."""
+    proc = mock.Mock()
+    proc.pid = pid
+    proc.returncode = returncode
+    proc.communicate.return_value = (stdout, stderr)
+    return proc
+
+
 class TestRunCommandApprovalFlow:
     """Phase 4's core guarantee, same shape as Phase 3's: the model proposes
     a command, the loop pauses with a 'confirm_command' event, and nothing
-    executes until the caller sends back an explicit True. subprocess.run is
-    always mocked -- no real process runs in these tests.
+    executes until the caller sends back an explicit True. subprocess.Popen
+    is always mocked -- no real process runs in these tests (except the
+    dedicated real-subprocess tests in test_tools_terminal.py).
     """
 
     def test_approved_command_executes(self, registry):
@@ -561,13 +710,13 @@ class TestRunCommandApprovalFlow:
         second_call = updates(("Tests passed.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
-        fake_proc = mock.Mock(returncode=0, stdout="2 passed\n", stderr="")
-        with mock.patch("agent.tools.terminal.subprocess.run", return_value=fake_proc) as mock_run:
+        fake_proc = _fake_terminal_proc(returncode=0, stdout="2 passed\n", stderr="")
+        with mock.patch("agent.tools.terminal.subprocess.Popen", return_value=fake_proc) as mock_popen:
             messages = [{"role": "user", "content": "run the tests"}]
             gen = run_agent_turn(client, registry, messages)
             events = drive_agent_turn(gen, decisions=[True])
 
-        mock_run.assert_called_once()
+        mock_popen.assert_called_once()
         confirm_events = [e for e in events if e["type"] == "confirm_command"]
         result_events = [e for e in events if e["type"] == "command_result"]
         assert len(confirm_events) == 1
@@ -587,7 +736,7 @@ class TestRunCommandApprovalFlow:
         second_call = updates(("Okay, not running it.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
-        with mock.patch("agent.tools.terminal.subprocess.run") as mock_run:
+        with mock.patch("agent.tools.terminal.subprocess.Popen") as mock_run:
             messages = [{"role": "user", "content": "run the tests"}]
             gen = run_agent_turn(client, registry, messages)
             events = drive_agent_turn(gen, decisions=[False])
@@ -613,7 +762,7 @@ class TestRunCommandApprovalFlow:
         second_call = updates(("I can't run that.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
-        with mock.patch("agent.tools.terminal.subprocess.run") as mock_run:
+        with mock.patch("agent.tools.terminal.subprocess.Popen") as mock_run:
             messages = [{"role": "user", "content": "delete everything"}]
             gen = run_agent_turn(client, registry, messages)
             events = drive_agent_turn(gen)
@@ -643,7 +792,7 @@ class TestRunCommandApprovalFlow:
         second_call = updates(("That's not allowed.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
-        with mock.patch("agent.tools.terminal.subprocess.run") as mock_run:
+        with mock.patch("agent.tools.terminal.subprocess.Popen") as mock_run:
             messages = [{"role": "user", "content": "run pytest; rm -rf ."}]
             gen = run_agent_turn(client, registry, messages)
             events = drive_agent_turn(gen)
@@ -652,8 +801,6 @@ class TestRunCommandApprovalFlow:
         assert not any(e["type"] == "confirm_command" for e in events)
 
     def test_timed_out_command_reports_tool_error_too(self, registry):
-        import subprocess
-
         client = mock.create_autospec(OllamaClient, instance=True)
         first_call = updates(
             (
@@ -665,9 +812,19 @@ class TestRunCommandApprovalFlow:
         second_call = updates(("It timed out.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
+        # Deterministically simulate a hung process: the first
+        # remaining-time check already reads as expired (no real waiting).
+        fake_proc = _fake_terminal_proc(returncode=None)
+        fake_proc.communicate.side_effect = [("partial", "")]
+        monotonic_values = iter([0.0, 5.0])
         with mock.patch(
-            "agent.tools.terminal.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd=["pytest"], timeout=5),
+            "agent.tools.terminal.subprocess.Popen", return_value=fake_proc
+        ), mock.patch(
+            "agent.tools.terminal.time.monotonic", side_effect=lambda: next(monotonic_values)
+        ), mock.patch(
+            "agent.tools.terminal.os.getpgid", return_value=4242
+        ), mock.patch("agent.tools.terminal.os.killpg"), mock.patch.object(
+            fake_proc, "wait", return_value=None
         ):
             messages = [{"role": "user", "content": "run the tests"}]
             gen = run_agent_turn(client, registry, messages)
@@ -694,13 +851,13 @@ class TestRunCommandApprovalFlow:
         second_call = updates(("Done.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
-        fake_proc = mock.Mock(returncode=0, stdout="ok\n", stderr="")
-        with mock.patch("agent.tools.terminal.subprocess.run", return_value=fake_proc) as mock_run:
+        fake_proc = _fake_terminal_proc(returncode=0, stdout="ok\n", stderr="")
+        with mock.patch("agent.tools.terminal.subprocess.Popen", return_value=fake_proc) as mock_popen:
             messages = [{"role": "user", "content": "run tests and lint"}]
             gen = run_agent_turn(client, registry, messages)
             events = drive_agent_turn(gen, decisions=[True, False])  # approve pytest, reject ruff
 
-        assert mock_run.call_count == 1  # only the approved one actually ran
+        assert mock_popen.call_count == 1  # only the approved one actually ran
         applied = [e for e in events if e["type"] == "command_result"]
         rejected = [e for e in events if e["type"] == "command_rejected"]
         assert len(applied) == 1
@@ -919,3 +1076,318 @@ class TestGitApprovalFlow:
 
         assert staged == ["README.md"]
         assert unstaged == ["backend/auth.py"]
+
+
+class TestPlanApprovalFlow:
+    """Phase 6's planning mechanism reuses the same propose/confirm/adopt
+    pattern as file edits, commands, and Git operations. A plan itself has
+    no side effects -- there's nothing to "execute" -- but it still must be
+    explicitly approved before it becomes the active plan, and rejecting it
+    must leave task_state untouched.
+    """
+
+    def test_approved_plan_is_adopted_into_task_state(self, registry, task_state):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "create_plan",
+                            "arguments": {
+                                "goal": "Add JWT authentication",
+                                "steps": ["Inspect auth", "Add endpoint", "Add tests"],
+                            },
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+        second_call = updates(("Here's my plan.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "Add JWT authentication"}]
+        gen = run_agent_turn(client, registry, messages, task_state=task_state)
+        events = drive_agent_turn(gen, decisions=[True])
+
+        confirm_events = [e for e in events if e["type"] == "confirm_plan"]
+        approved_events = [e for e in events if e["type"] == "plan_approved"]
+        assert len(confirm_events) == 1
+        assert confirm_events[0]["plan"].goal == "Add JWT authentication"
+        assert len(approved_events) == 1
+
+        assert task_state.goal == "Add JWT authentication"
+        assert task_state.plan is not None
+        assert len(task_state.plan.steps) == 3
+        assert all(s.status == "pending" for s in task_state.plan.steps)
+
+    def test_rejected_plan_is_not_adopted(self, registry, task_state):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "create_plan",
+                            "arguments": {"goal": "Add JWT auth", "steps": ["a", "b"]},
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+        second_call = updates(("Okay, I won't create a plan.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "Add JWT auth"}]
+        gen = run_agent_turn(client, registry, messages, task_state=task_state)
+        events = drive_agent_turn(gen, decisions=[False])
+
+        rejected_events = [e for e in events if e["type"] == "plan_rejected"]
+        assert len(rejected_events) == 1
+        assert task_state.plan is None
+        assert task_state.goal is None
+
+        tool_messages = [m for m in messages if m["role"] == "tool"]
+        assert "did not approve" in tool_messages[0]["content"].lower()
+
+    def test_update_plan_after_approval_changes_task_state(self, registry, task_state):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        create_call = updates(
+            (
+                "",
+                [{"function": {"name": "create_plan", "arguments": {"goal": "Add X", "steps": ["a", "b"]}}}],
+                True,
+            ),
+        )
+        update_call = updates(
+            (
+                "",
+                [{"function": {"name": "update_plan", "arguments": {"step_id": 1, "status": "completed"}}}],
+                True,
+            ),
+        )
+        final_call = updates(("Step 1 done.", None, True))
+        client.chat.side_effect = [create_call, update_call, final_call]
+
+        messages = [{"role": "user", "content": "Add X"}]
+        gen = run_agent_turn(client, registry, messages, task_state=task_state)
+        drive_agent_turn(gen, decisions=[True])
+
+        assert task_state.plan.get_step(1).status == "completed"
+
+    def test_small_task_never_calls_create_plan_is_unaffected(self, registry, task_state):
+        """Not calling create_plan at all (the expected behavior for a
+        small request) must work exactly as it did before Phase 6."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.return_value = updates(("Sure, done.", None, True))
+
+        messages = [{"role": "user", "content": "change the button text to Save"}]
+        events = list(run_agent_turn(client, registry, messages, task_state=task_state))
+
+        assert not any(e["type"] == "confirm_plan" for e in events)
+        assert task_state.plan is None
+
+    def test_task_state_records_read_file_during_a_plan(self, registry, task_state, project):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "read_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+        second_call = updates(("It's a JWTAuth class.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "what's in backend/auth.py?"}]
+        gen = run_agent_turn(client, registry, messages, task_state=task_state)
+        list(drive_agent_turn(gen))
+
+        assert "backend/auth.py" in task_state.files_inspected
+
+
+class TestCancelEvent:
+    """cancel_event is additive -- Phase 7's Stop Task mechanism -- and must
+    have zero effect on any existing caller that doesn't pass it (default
+    None), and must stop a turn cleanly (no partial/corrupt state) when set.
+    """
+
+    def test_unset_cancel_event_behaves_exactly_like_no_cancel_event(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.return_value = updates(("Hello", None, True))
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(
+            run_agent_turn(client, registry, messages, cancel_event=threading.Event())
+        )
+
+        assert events[-1] == {"type": "final", "text": "Hello"}
+
+    def test_cancel_event_set_before_first_iteration_stops_immediately(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages, cancel_event=cancel_event))
+
+        assert events == [{"type": "cancelled"}]
+        client.chat.assert_not_called()
+
+    def test_ollama_cancelled_error_during_streaming_yields_cancelled(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        def raise_cancelled(*args, **kwargs):
+            raise OllamaCancelledError("Generation was cancelled.")
+            yield  # pragma: no cover - makes this a generator function
+
+        client.chat.side_effect = raise_cancelled
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(
+            run_agent_turn(client, registry, messages, cancel_event=threading.Event())
+        )
+
+        assert events == [{"type": "cancelled"}]
+
+    def test_cancel_event_is_passed_through_to_chat(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.return_value = updates(("Hello", None, True))
+        cancel_event = threading.Event()
+
+        messages = [{"role": "user", "content": "hi"}]
+        list(run_agent_turn(client, registry, messages, cancel_event=cancel_event))
+
+        _, kwargs = client.chat.call_args
+        assert kwargs.get("cancel_event") is cancel_event
+
+    def test_messages_left_consistent_after_cancellation(self, registry):
+        """A cancelled turn must not leave a dangling assistant tool_calls
+        message with no matching tool result -- the conversation should be
+        exactly as it was before this turn's model call, so the next turn
+        (or /new) starts from clean state."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        messages = [{"role": "user", "content": "hi"}]
+        list(run_agent_turn(client, registry, messages, cancel_event=cancel_event))
+
+        assert messages == [{"role": "user", "content": "hi"}]
+
+
+class TestRepetitionDetection:
+    """Phase 8: the same (tool, arguments) signature repeated
+    MAX_CONSECUTIVE_IDENTICAL_CALLS times in a row -- whether it keeps
+    "succeeding" with no progress or keeps failing the same way -- must be
+    intercepted before a 3rd/4th real (re-)execution, not just eventually
+    stopped by max_iterations."""
+
+    def test_identical_read_only_call_repeated_is_intercepted(self, registry, project):
+        (project.root / "backend" / "auth.py").write_text("class JWTAuth:\n    pass\n")
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        # A generator is consumed after one iteration, so each call to
+        # client.chat() must build a *fresh* one -- reusing the same
+        # generator object across side_effect entries would silently yield
+        # nothing on the 2nd+ call, which isn't what this test means to do.
+        client.chat.side_effect = lambda *a, **k: updates(
+            ("", [{"function": {"name": "read_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+
+        messages = [{"role": "user", "content": "keep reading the same file"}]
+        events = list(run_agent_turn(client, registry, messages, max_iterations=4))
+
+        repetition_events = [e for e in events if e["type"] == "repetition_detected"]
+        tool_call_events = [e for e in events if e["type"] == "tool_call" and e["name"] == "read_file"]
+
+        # 2 real executions (count 1, 2), then intercepted from the 3rd
+        # identical call onward (this loop runs 4 iterations total).
+        assert len(tool_call_events) == 2
+        assert len(repetition_events) == 2
+        assert repetition_events[0]["count"] == 3
+        assert repetition_events[1]["count"] == 4
+        assert repetition_events[0]["name"] == "read_file"
+
+    def test_repetition_counter_resets_on_a_different_call(self, registry, project):
+        (project.root / "backend" / "auth.py").write_text("class JWTAuth:\n    pass\n")
+        client = mock.create_autospec(OllamaClient, instance=True)
+
+        def make_read_call(*_a, **_k):
+            return updates(
+                ("", [{"function": {"name": "read_file", "arguments": {"path": "backend/auth.py"}}}], True),
+            )
+
+        def make_list_call(*_a, **_k):
+            return updates(
+                ("", [{"function": {"name": "list_files", "arguments": {"path": "."}}}], True),
+            )
+
+        # read, read, list (different -- resets the streak), read, read: no
+        # occurrence ever reaches 3 in a row, so nothing should be intercepted.
+        client.chat.side_effect = [
+            make_read_call(),
+            make_read_call(),
+            make_list_call(),
+            make_read_call(),
+            make_read_call(),
+        ]
+
+        messages = [{"role": "user", "content": "hi"}]
+        events = list(run_agent_turn(client, registry, messages, max_iterations=5))
+
+        assert not any(e["type"] == "repetition_detected" for e in events)
+
+    def test_repeated_call_does_not_reach_registry_a_third_time(self, registry, project):
+        """The intercepted call must not actually re-execute the tool --
+        only the first MAX_CONSECUTIVE_IDENTICAL_CALLS-1 executions should
+        really run."""
+        (project.root / "backend" / "auth.py").write_text("class JWTAuth:\n    pass\n")
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = lambda *a, **k: updates(
+            ("", [{"function": {"name": "read_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+
+        messages = [{"role": "user", "content": "hi"}]
+        list(run_agent_turn(client, registry, messages, max_iterations=3))
+
+        # Only 2 real read_file executions should have happened -- check via
+        # the tool message contents appended to the conversation.
+        tool_messages = [m for m in messages if m.get("role") == "tool" and m.get("tool_name") == "read_file"]
+        assert len(tool_messages) == 3  # 2 real reads + 1 synthetic repetition notice
+        assert "repeated" in tool_messages[-1]["content"].lower()
+        assert "class JWTAuth" in tool_messages[0]["content"]
+        assert "class JWTAuth" in tool_messages[1]["content"]
+
+    def test_repeated_failing_edit_is_also_intercepted(self, registry, project):
+        """Covers spec section 10 (failed-approach detection): the same
+        proposal that keeps failing validation is exactly as much a stuck
+        loop as a successful no-op repeat."""
+        (project.root / "x.py").write_text("value = 1\n")
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = lambda *a, **k: updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": {
+                                "path": "x.py",
+                                "old_text": "value = 999\n",  # doesn't match -- always fails
+                                "new_text": "value = 2\n",
+                            },
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+
+        messages = [{"role": "user", "content": "fix it"}]
+        events = list(run_agent_turn(client, registry, messages, max_iterations=3))
+
+        tool_error_events = [e for e in events if e["type"] == "tool_error"]
+        repetition_events = [e for e in events if e["type"] == "repetition_detected"]
+        assert len(tool_error_events) == 2  # first 2 attempts genuinely fail validation
+        assert len(repetition_events) == 1  # 3rd is intercepted instead of failing again

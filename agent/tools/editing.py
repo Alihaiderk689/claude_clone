@@ -19,7 +19,14 @@ from pydantic import BaseModel, Field
 
 from ..diff import ProposedChange
 from ..project import HARD_MAX_FILE_SIZE_BYTES, PathSecurityError, ProjectRoot
-from .base import Tool, ToolError, ToolResult
+from .base import (
+    NotFoundError,
+    PermissionDeniedError,
+    StaleStateError,
+    Tool,
+    ToolError,
+    ToolResult,
+)
 from .state import FileStateTracker
 
 DEFAULT_NEW_FILE_MODE = 0o644
@@ -66,25 +73,37 @@ def _edit_file(
 ) -> ToolResult:
     target = _safe_resolve(project, args.path)
 
-    if not target.exists():
-        raise ToolError(f"File not found: '{args.path}'. Use write_file to create a new file.")
+    try:
+        exists = target.exists()
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
+    if not exists:
+        raise NotFoundError(f"File not found: '{args.path}'. Use write_file to create a new file.")
     if target.is_dir():
         raise ToolError(f"'{args.path}' is a directory, not a file.")
     if project.is_sensitive(target):
-        raise ToolError(f"Refusing to edit '{args.path}': it matches a sensitive-file pattern.")
+        raise PermissionDeniedError(f"Refusing to edit '{args.path}': it matches a sensitive-file pattern.")
     if not args.old_text:
         raise ToolError("old_text must not be empty.")
     if args.old_text == args.new_text:
         raise ToolError("old_text and new_text are identical; there's nothing to change.")
 
-    size = target.stat().st_size
+    try:
+        size = target.stat().st_size
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
     if size > HARD_MAX_FILE_SIZE_BYTES:
         raise ToolError(f"'{args.path}' is {size:,} bytes, far too large to edit.")
 
-    normalized, newline = _decode_and_detect_newline(target.read_bytes())
+    try:
+        raw = target.read_bytes()
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied reading '{args.path}': {exc}") from exc
+
+    normalized, newline = _decode_and_detect_newline(raw)
 
     if tracker is not None and not tracker.is_fresh(target, normalized):
-        raise ToolError(
+        raise StaleStateError(
             f"'{args.path}' changed on disk since it was last read. Refusing to apply a possibly "
             "stale edit — read_file it again and re-propose the edit against its current content."
         )
@@ -129,10 +148,14 @@ def _write_file(
     target = _safe_resolve(project, args.path)
 
     if project.is_sensitive(target):
-        raise ToolError(f"Refusing to create '{args.path}': it matches a sensitive-file pattern.")
+        raise PermissionDeniedError(f"Refusing to create '{args.path}': it matches a sensitive-file pattern.")
     if target.is_dir():
         raise ToolError(f"'{args.path}' is a directory.")
-    if target.exists():
+    try:
+        already_exists = target.exists()
+    except PermissionError as exc:
+        raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
+    if already_exists:
         raise ToolError(
             f"'{args.path}' already exists. Use edit_file to modify an existing file instead of "
             "write_file, which is only for creating new files."
@@ -192,16 +215,30 @@ def apply_change(change: ProposedChange, tracker: Optional[FileStateTracker]) ->
     """
     try:
         _atomic_write(change.resolved_path, change.new_content, change.newline, change.original_mode)
+    except PermissionError as exc:
+        return ToolResult(
+            ok=False,
+            output=f"Permission denied writing '{change.path}': {exc}. The original file was left unchanged.",
+            error_type="PermissionError",
+            recoverable=False,
+        )
     except OSError as exc:
         return ToolResult(
             ok=False,
             output=f"Failed to write '{change.path}': {exc}. The original file was left unchanged.",
+            error_type="ToolExecutionError",
+            recoverable=True,
         )
 
     try:
         written_text, _ = _decode_and_detect_newline(change.resolved_path.read_bytes())
     except (OSError, ToolError) as exc:
-        return ToolResult(ok=False, output=f"Wrote '{change.path}' but could not verify it: {exc}")
+        return ToolResult(
+            ok=False,
+            output=f"Wrote '{change.path}' but could not verify it: {exc}",
+            error_type="ToolExecutionError",
+            recoverable=True,
+        )
 
     if written_text != change.new_content:
         return ToolResult(

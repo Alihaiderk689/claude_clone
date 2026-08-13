@@ -13,6 +13,7 @@ from agent.git_policy import (
     GitPolicyError,
     validate_branch_name,
     validate_commit_message,
+    validate_remote_name,
     validate_stage_paths,
 )
 from agent.project import ProjectRoot
@@ -157,3 +158,40 @@ class TestValidateCommitMessage:
     def test_nul_byte_rejected(self):
         with pytest.raises(GitPolicyError):
             validate_commit_message("bad\x00message")
+
+
+class TestValidateRemoteName:
+    """Format-only validation -- whether the name is an *actually
+    configured* remote is checked separately in agent/tools/git.py against
+    real `git remote` output, not here."""
+
+    def test_simple_name_accepted(self):
+        assert validate_remote_name("origin") == "origin"
+
+    def test_name_with_dashes_and_dots_accepted(self):
+        assert validate_remote_name("my-remote.v2") == "my-remote.v2"
+
+    def test_empty_name_rejected(self):
+        with pytest.raises(GitPolicyError):
+            validate_remote_name("")
+
+    def test_whitespace_only_rejected(self):
+        with pytest.raises(GitPolicyError):
+            validate_remote_name("   ")
+
+    def test_leading_dash_rejected(self):
+        with pytest.raises(GitPolicyError):
+            validate_remote_name("-force")
+
+    def test_shell_metacharacters_rejected(self):
+        with pytest.raises(GitPolicyError):
+            validate_remote_name("origin; rm -rf .")
+
+    def test_space_in_name_rejected(self):
+        with pytest.raises(GitPolicyError):
+            validate_remote_name("my remote")
+
+    def test_slash_in_name_rejected(self):
+        """Unlike branch names, remote names don't need to allow '/'."""
+        with pytest.raises(GitPolicyError):
+            validate_remote_name("some/remote")

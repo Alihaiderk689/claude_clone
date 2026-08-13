@@ -7,12 +7,13 @@ raise a specific exception describing what went wrong.
 from __future__ import annotations
 
 import json
+import threading
 from typing import Dict, Iterator, List, Optional
 
 import requests
 
 DEFAULT_HOST = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5-coder:7b"
+DEFAULT_MODEL = "qwen2.5-coder:3b"
 DEFAULT_TIMEOUT = 120  # generation on CPU can be slow; keep this generous
 
 
@@ -36,6 +37,10 @@ class OllamaAPIError(OllamaError):
     """Raised for any other error the Ollama API reports."""
 
 
+class OllamaCancelledError(OllamaError):
+    """Raised when a caller-supplied cancel_event was set during streaming."""
+
+
 class OllamaClient:
     """Minimal client for the Ollama /api/chat and /api/tags endpoints."""
 
@@ -57,17 +62,26 @@ class OllamaClient:
         except requests.exceptions.RequestException:
             return False
 
-    def chat_stream(self, messages: List[Dict[str, str]]) -> Iterator[str]:
+    def chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Iterator[str]:
         """Send a conversation to Ollama and yield assistant text as it arrives.
 
         `messages` follows the standard {"role": ..., "content": ...} format
         with roles "system", "user", and "assistant". No tools are offered.
         """
-        for update in self._chat_updates(messages, tools=None):
+        for update in self._chat_updates(messages, tools=None, cancel_event=cancel_event):
             if update["content"]:
                 yield update["content"]
 
-    def chat(self, messages: List[Dict], tools: Optional[List[dict]] = None) -> Iterator[dict]:
+    def chat(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[dict]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Iterator[dict]:
         """Send a conversation to Ollama, optionally offering tools, and yield
         structured updates as they stream in:
 
@@ -75,11 +89,19 @@ class OllamaClient:
 
         `tool_calls`, when present, follows Ollama's native function-calling
         format: [{"function": {"name": ..., "arguments": {...}}}, ...].
+
+        If `cancel_event` is given and becomes set while streaming, iteration
+        stops early and raises OllamaCancelledError -- used by the local HTTP
+        server's Stop Task endpoint. Left as None (the default), behavior is
+        identical to before this parameter existed.
         """
-        return self._chat_updates(messages, tools=tools)
+        return self._chat_updates(messages, tools=tools, cancel_event=cancel_event)
 
     def _chat_updates(
-        self, messages: List[Dict], tools: Optional[List[dict]]
+        self,
+        messages: List[Dict],
+        tools: Optional[List[dict]],
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[dict]:
         url = f"{self.host}/api/chat"
         payload = {"model": self.model, "messages": messages, "stream": True}
@@ -90,11 +112,18 @@ class OllamaClient:
 
         try:
             for line in response.iter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise OllamaCancelledError("Generation was cancelled.")
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    # Valid JSON but not the object shape the API contract
+                    # promises (e.g. a bare string/number/list) -- treat as
+                    # one malformed line, not a fatal error for the stream.
                     continue
 
                 if "error" in data:
@@ -106,12 +135,29 @@ class OllamaClient:
                         )
                     raise OllamaAPIError(f"Ollama returned an error: {error_msg}")
 
-                message = data.get("message") or {}
-                yield {
-                    "content": message.get("content") or "",
-                    "tool_calls": message.get("tool_calls") or None,
+                message = data.get("message")
+                if not isinstance(message, dict):
+                    message = {}
+                tool_calls = message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    tool_calls = None
+                content = message.get("content")
+                if not isinstance(content, str):
+                    content = ""
+                update = {
+                    "content": content,
+                    "tool_calls": tool_calls,
                     "done": bool(data.get("done")),
                 }
+                # Ollama includes these only on the final chunk of a
+                # response; surfaced for the local benchmark harness
+                # (agent/benchmark.py) to report "tokens if available" --
+                # purely informational, no behavior depends on them.
+                if isinstance(data.get("eval_count"), int):
+                    update["eval_count"] = data["eval_count"]
+                if isinstance(data.get("prompt_eval_count"), int):
+                    update["prompt_eval_count"] = data["prompt_eval_count"]
+                yield update
 
                 if data.get("done"):
                     break

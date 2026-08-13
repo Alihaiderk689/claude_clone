@@ -12,7 +12,10 @@ model's own say-so, and never unrestricted shell access.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -31,6 +34,16 @@ from .base import Tool, ToolError, ToolResult
 
 MAX_STDOUT_CHARS = 12000
 MAX_STDERR_CHARS = 12000
+
+# How often the wait loop below wakes up to check the timeout and
+# cancel_event -- small enough that Stop Task feels responsive, large
+# enough not to busy-loop.
+CANCEL_POLL_INTERVAL_SECONDS = 0.1
+# How long to give a killed process to exit cleanly after SIGTERM before
+# escalating to SIGKILL, and how long to wait for it to actually die after
+# that -- generous enough for e.g. pytest's own teardown, short enough that
+# Stop Task still feels responsive.
+PROCESS_TERMINATE_GRACE_SECONDS = 2.0
 
 # Allowlist, not denylist: only these survive into the subprocess's
 # environment. Strips API keys, tokens, and other secrets that might
@@ -63,6 +76,10 @@ class CommandExecutionResult:
     stdout: str
     stderr: str
     timed_out: bool
+    # True if a caller-supplied cancel_event (Stop Task) interrupted this
+    # command rather than it finishing or hitting its own timeout. Default
+    # False keeps every existing construction of this dataclass valid.
+    cancelled: bool = False
 
 
 def describe_command(cmd: ApprovedCommand) -> str:
@@ -94,38 +111,65 @@ def _minimal_env() -> dict:
     return {name: os.environ[name] for name in _SAFE_ENV_VARS if name in os.environ}
 
 
-def execute_command(cmd: ApprovedCommand) -> CommandExecutionResult:
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """Terminate the whole process group execute_command started (see
+    start_new_session=True below), not just the direct child -- so e.g. a
+    test runner's own worker subprocesses don't survive a timeout or Stop
+    Task. SIGTERM first for a chance at clean shutdown, escalating to
+    SIGKILL only if it's still alive after the grace period. Only ever
+    signals the group this specific command created -- never anything else
+    on the system.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass  # pragma: no cover - SIGKILL not being honored would be an OS-level issue
+
+
+def execute_command(
+    cmd: ApprovedCommand, cancel_event: Optional[threading.Event] = None
+) -> CommandExecutionResult:
     """Actually run an approved command. Only ever called by the agent loop
     after the user has explicitly approved -- never by a tool's run().
+
+    Runs in its own process group (start_new_session=True) and polls in
+    short increments (CANCEL_POLL_INTERVAL_SECONDS) rather than blocking for
+    the full timeout in one call, so that if `cancel_event` (Stop Task) is
+    set while the command is running, the whole process group is actually
+    terminated -- not just abandoned while the subprocess keeps running in
+    the background. The existing hard per-command timeout uses the exact
+    same termination path.
     """
     argv = [cmd.program, *cmd.args]
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
             cwd=str(cmd.cwd),
             shell=False,
-            capture_output=True,
-            timeout=cmd.timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             encoding="utf-8",
             errors="replace",
             env=_minimal_env(),
-        )
-        return CommandExecutionResult(
-            program=cmd.program,
-            args=cmd.args,
-            exit_code=proc.returncode,
-            stdout=_truncate(proc.stdout or "", MAX_STDOUT_CHARS, "stdout"),
-            stderr=_truncate(proc.stderr or "", MAX_STDERR_CHARS, "stderr"),
-            timed_out=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return CommandExecutionResult(
-            program=cmd.program,
-            args=cmd.args,
-            exit_code=None,
-            stdout=_truncate(exc.stdout or "", MAX_STDOUT_CHARS, "stdout"),
-            stderr=_truncate(exc.stderr or "", MAX_STDERR_CHARS, "stderr"),
-            timed_out=True,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return CommandExecutionResult(
@@ -149,10 +193,50 @@ def execute_command(cmd: ApprovedCommand) -> CommandExecutionResult:
             timed_out=False,
         )
 
+    start = time.monotonic()
+    timed_out = False
+    cancelled = False
+    stdout = ""
+    stderr = ""
+
+    while True:
+        remaining = cmd.timeout - (time.monotonic() - start)
+        if remaining <= 0:
+            timed_out = True
+            _kill_process_group(proc)
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            _kill_process_group(proc)
+            break
+        try:
+            stdout, stderr = proc.communicate(timeout=min(CANCEL_POLL_INTERVAL_SECONDS, remaining))
+            break  # process finished on its own
+        except subprocess.TimeoutExpired:
+            continue
+
+    if timed_out or cancelled:
+        try:
+            stdout, stderr = proc.communicate(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defense in depth
+            stdout, stderr = stdout or "", stderr or ""
+
+    return CommandExecutionResult(
+        program=cmd.program,
+        args=cmd.args,
+        exit_code=proc.returncode,
+        stdout=_truncate(stdout or "", MAX_STDOUT_CHARS, "stdout"),
+        stderr=_truncate(stderr or "", MAX_STDERR_CHARS, "stderr"),
+        timed_out=timed_out,
+        cancelled=cancelled,
+    )
+
 
 def format_result_for_model(result: CommandExecutionResult) -> str:
     header = f"$ {result.program} {' '.join(result.args)}".rstrip()
-    if result.timed_out:
+    if result.cancelled:
+        status = "CANCELLED BY USER (no exit code; process was terminated)"
+    elif result.timed_out:
         status = "TIMED OUT (no exit code; process was terminated)"
     else:
         status = f"exit code: {result.exit_code}"

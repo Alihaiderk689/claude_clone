@@ -1,8 +1,9 @@
 """Tests for cli.py's approval-prompt parsing: _ask_approval/_handle_confirm
 (file changes), _ask_command_approval/_handle_command_confirm (run_command),
-and _ask_git_approval/_handle_git_confirm (Git operations). These are pure
-enough to test directly against a mocked Rich Console, without needing a
-real terminal or model.
+_ask_git_approval/_handle_git_confirm (Git operations), and
+_ask_plan_approval/_handle_plan_confirm (plans). These are pure enough to
+test directly against a mocked Rich Console, without needing a real
+terminal or model.
 """
 from __future__ import annotations
 
@@ -13,13 +14,16 @@ from agent.cli import (
     _ask_approval,
     _ask_command_approval,
     _ask_git_approval,
+    _ask_plan_approval,
     _handle_command_confirm,
     _handle_confirm,
     _handle_git_confirm,
+    _handle_plan_confirm,
 )
 from agent.command_policy import ApprovedCommand
 from agent.diff import ProposedChange
 from agent.git_policy import ProposedGitOperation
+from agent.planner import Plan, PlanStep
 
 
 def make_console(input_value: str):
@@ -266,3 +270,59 @@ class TestHandleGitConfirm:
     def test_commit_rejected_on_bare_enter(self):
         console = make_console("")
         assert _handle_git_confirm(console, self._commit_op()) is False
+
+
+class TestAskPlanApproval:
+    """Plan approval is the one deliberate exception in this app: a bare
+    Enter means YES, since a plan has no side effects of its own to guard
+    against -- only an explicit n/no rejects it."""
+
+    def test_bare_enter_approves(self):
+        assert _ask_plan_approval(make_console("")) is True
+
+    def test_y_approves(self):
+        assert _ask_plan_approval(make_console("y")) is True
+
+    def test_yes_approves(self):
+        assert _ask_plan_approval(make_console("yes")) is True
+
+    def test_garbage_input_approves(self):
+        """Anything that isn't an explicit rejection defaults to proceed,
+        the inverse of every other approval prompt in this app."""
+        assert _ask_plan_approval(make_console("sure whatever")) is True
+
+    def test_n_rejects(self):
+        assert _ask_plan_approval(make_console("n")) is False
+
+    def test_no_rejects(self):
+        assert _ask_plan_approval(make_console("no")) is False
+
+    def test_uppercase_n_rejects(self):
+        assert _ask_plan_approval(make_console("N")) is False
+
+
+class TestHandlePlanConfirm:
+    def _plan(self):
+        return Plan(
+            goal="Add JWT authentication",
+            steps=[
+                PlanStep(id=1, description="Inspect auth"),
+                PlanStep(id=2, description="Add endpoint"),
+            ],
+        )
+
+    def test_approved_on_bare_enter(self):
+        console = make_console("")
+        assert _handle_plan_confirm(console, self._plan()) is True
+
+    def test_rejected_on_explicit_no(self):
+        console = make_console("n")
+        assert _handle_plan_confirm(console, self._plan()) is False
+
+    def test_prompt_shows_goal_and_steps(self):
+        console = make_console("n")
+        _handle_plan_confirm(console, self._plan())
+        printed = _all_console_output(console)
+        assert "Inspect auth" in printed
+        assert "Add endpoint" in printed
+        assert "Proceed?" in printed

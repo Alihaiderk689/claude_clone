@@ -6,6 +6,7 @@ require a running Ollama server or a downloaded model.
 from __future__ import annotations
 
 import json
+import threading
 from unittest import mock
 
 import pytest
@@ -13,6 +14,7 @@ import requests
 
 from agent.ollama_client import (
     OllamaAPIError,
+    OllamaCancelledError,
     OllamaClient,
     OllamaConnectionError,
     OllamaModelNotFoundError,
@@ -132,3 +134,113 @@ class TestChatStream:
     def test_host_trailing_slash_is_stripped(self):
         client = OllamaClient(host="http://localhost:11434/")
         assert client.host == "http://localhost:11434"
+
+
+class TestCancelEvent:
+    """cancel_event is Phase 7's additive Stop Task mechanism -- must be a
+    no-op when omitted/unset, and must interrupt streaming promptly when
+    set, without needing the server to finish sending its response."""
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_no_cancel_event_behaves_as_before(self, mock_post):
+        lines = [json.dumps({"message": {"content": "hi"}, "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        result = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+        assert result == ["hi"]
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_unset_cancel_event_does_not_raise(self, mock_post):
+        lines = [json.dumps({"message": {"content": "hi"}, "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        result = list(
+            client.chat_stream([{"role": "user", "content": "hi"}], cancel_event=threading.Event())
+        )
+        assert result == ["hi"]
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_set_cancel_event_raises_before_processing_further_lines(self, mock_post):
+        lines = [
+            json.dumps({"message": {"content": "hi"}, "done": False}),
+            json.dumps({"message": {"content": " there"}, "done": True}),
+        ]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with pytest.raises(OllamaCancelledError):
+            list(
+                client.chat_stream(
+                    [{"role": "user", "content": "hi"}], cancel_event=cancel_event
+                )
+            )
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_chat_forwards_cancel_event(self, mock_post):
+        lines = [json.dumps({"message": {"content": "hi"}, "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with pytest.raises(OllamaCancelledError):
+            list(client.chat([{"role": "user", "content": "hi"}], cancel_event=cancel_event))
+
+
+class TestMalformedResponses:
+    """Phase 8: a stream line that's valid JSON but not the object shape
+    the API contract promises must be skipped, not crash the client with
+    an AttributeError/TypeError from blindly calling .get() on it."""
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_bare_json_list_line_is_skipped(self, mock_post):
+        lines = [
+            json.dumps([1, 2, 3]),
+            json.dumps({"message": {"content": "hi"}, "done": True}),
+        ]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        result = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+        assert result == ["hi"]
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_bare_json_string_line_is_skipped(self, mock_post):
+        lines = [json.dumps("just a string"), json.dumps({"message": {"content": "ok"}, "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        result = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+        assert result == ["ok"]
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_message_field_not_a_dict_does_not_crash(self, mock_post):
+        lines = [json.dumps({"message": "not an object", "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        result = list(client.chat_stream([{"role": "user", "content": "hi"}]))
+        assert result == []  # no content extracted, but no crash
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_tool_calls_field_not_a_list_is_ignored(self, mock_post):
+        lines = [json.dumps({"message": {"content": "", "tool_calls": "not-a-list"}, "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        updates_list = list(client.chat([{"role": "user", "content": "hi"}]))
+        assert updates_list[0]["tool_calls"] is None
+
+    @mock.patch("agent.ollama_client.requests.post")
+    def test_content_field_not_a_string_is_ignored(self, mock_post):
+        lines = [json.dumps({"message": {"content": 12345}, "done": True})]
+        mock_post.return_value = make_stream_response(lines)
+        client = OllamaClient()
+
+        updates_list = list(client.chat([{"role": "user", "content": "hi"}]))
+        assert updates_list[0]["content"] == ""
