@@ -23,6 +23,21 @@
   let currentAgentParagraph = null;
   let pendingApprovalBox = null;
 
+  // Vertical activity timeline (one segment per user turn) -- see
+  // ensureTimeline()/resolveStep()/setActiveStep() below. `activeTimelineItem`
+  // is the trailing "currently working" node (e.g. "Thinking..."); resolving
+  // it converts it in place into a completed step instead of appending a
+  // second element, so there's always at most one active node per turn.
+  let currentTimeline = null;
+  let activeTimelineItem = null;
+  // Cached data from confirm/confirm_command events, keyed so the LATER
+  // change_applied/command_result event (which the backend sends with no
+  // content of its own) can still build a rich preview. Safe because
+  // approvals are strictly serial within a turn -- no protocol change on
+  // the Python side was needed for this.
+  const pendingChangesByPath = new Map();
+  let pendingCommand = null;
+
   function scrollToBottom() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -57,6 +72,7 @@
   function appendUserMessage(text) {
     pendingApprovalBox = null;
     currentAgentParagraph = null;
+    resetTimelineForNewTurn();
     const div = document.createElement("div");
     div.className = "message user";
     const role = document.createElement("span");
@@ -65,6 +81,7 @@
     div.appendChild(role);
     appendTextWithFileLinks(div, text);
     messagesEl.appendChild(div);
+    setActiveStep("Thinking...");
     scrollToBottom();
   }
 
@@ -96,6 +113,7 @@
   }
 
   function setFinalAgentText(text) {
+    clearActiveStep();
     const p = ensureAgentParagraph();
     if (p.textSoFar !== text) {
       p.textSoFar = text;
@@ -105,16 +123,143 @@
     scrollToBottom();
   }
 
-  function appendSubAction(text, cls) {
-    const span = document.createElement("span");
-    span.className = "sub-action " + cls;
-    span.textContent = text;
-    messagesEl.appendChild(span);
+  function ensureTimeline() {
+    if (currentTimeline) {
+      return currentTimeline;
+    }
+    const div = document.createElement("div");
+    div.className = "timeline";
+    messagesEl.appendChild(div);
+    currentTimeline = div;
+    return currentTimeline;
+  }
+
+  function resetTimelineForNewTurn() {
+    currentTimeline = null;
+    activeTimelineItem = null;
+    pendingChangesByPath.clear();
+    pendingCommand = null;
+  }
+
+  function makeDot() {
+    const dot = document.createElement("span");
+    dot.className = "timeline-dot";
+    return dot;
+  }
+
+  function buildSimpleLabel(container, text) {
+    const label = document.createElement("span");
+    label.className = "timeline-label";
+    appendTextWithFileLinks(label, text);
+    container.appendChild(label);
+  }
+
+  function buildRichLabel(container, verb, rest) {
+    const label = document.createElement("span");
+    label.className = "timeline-label";
+    const b = document.createElement("b");
+    b.textContent = verb;
+    label.appendChild(b);
+    if (rest) {
+      label.appendChild(document.createTextNode(" " + rest));
+    }
+    container.appendChild(label);
+  }
+
+  /** Converts the current active ("...ing") node in place into a resolved
+   * step, or appends a fresh resolved step if there's no active node to
+   * reuse -- either way there's exactly one element per logical step, never
+   * a disconnected pair. */
+  function resolveStep(cls, buildContent) {
+    const timeline = ensureTimeline();
+    let item = activeTimelineItem;
+    if (!item) {
+      item = document.createElement("div");
+      item.appendChild(makeDot());
+      const content = document.createElement("div");
+      content.className = "timeline-content";
+      item.appendChild(content);
+      timeline.appendChild(item);
+    }
+    item.className = "timeline-item " + cls;
+    const content = item.querySelector(".timeline-content");
+    content.textContent = "";
+    buildContent(content);
+    activeTimelineItem = null;
     scrollToBottom();
+    return item;
+  }
+
+  function appendTimelineStep(text, cls) {
+    resolveStep(cls, (content) => buildSimpleLabel(content, text));
+  }
+
+  function buildChangeContent(content, change) {
+    const verb = change.kind === "create" ? "Write" : "Edit";
+    buildRichLabel(content, verb, change.path);
+    const newContent = change.new_content || "";
+    const lines = newContent.length ? newContent.split("\n") : [];
+    const lineCount = lines.length && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+    const meta = document.createElement("div");
+    meta.className = "timeline-meta";
+    meta.textContent = lineCount + (lineCount === 1 ? " line" : " lines");
+    content.appendChild(meta);
+    if (newContent) {
+      const preview = document.createElement("pre");
+      preview.className = "timeline-preview";
+      const shown = lines.slice(0, 10);
+      preview.textContent = shown.join("\n") + (lines.length > 10 ? "\n..." : "");
+      content.appendChild(preview);
+    }
+  }
+
+  function buildCommandContent(content, cmd, resultLabel) {
+    buildRichLabel(content, "Bash", null);
+    if (cmd) {
+      const meta = document.createElement("div");
+      meta.className = "timeline-meta";
+      meta.textContent = cmd.program + " " + (cmd.args || []).join(" ");
+      content.appendChild(meta);
+    }
+    const box = document.createElement("pre");
+    box.className = "timeline-preview";
+    box.textContent = "IN " + (cmd ? cmd.cwd : "unknown") + (resultLabel ? "\n" + resultLabel : "");
+    content.appendChild(box);
+  }
+
+  /** Creates the trailing "currently working" node if none exists, or just
+   * updates its text in place if one already does (e.g. a retry message
+   * replacing "Thinking..." without adding a second dot). */
+  function setActiveStep(text) {
+    const timeline = ensureTimeline();
+    if (activeTimelineItem) {
+      activeTimelineItem.querySelector(".timeline-label").textContent = text;
+      scrollToBottom();
+      return activeTimelineItem;
+    }
+    const item = document.createElement("div");
+    item.className = "timeline-item active";
+    item.appendChild(makeDot());
+    const content = document.createElement("div");
+    content.className = "timeline-content";
+    buildSimpleLabel(content, text);
+    item.appendChild(content);
+    timeline.appendChild(item);
+    activeTimelineItem = item;
+    scrollToBottom();
+    return item;
+  }
+
+  function clearActiveStep() {
+    if (activeTimelineItem) {
+      activeTimelineItem.remove();
+      activeTimelineItem = null;
+    }
   }
 
   function appendErrorBanner(text) {
     currentAgentParagraph = null;
+    clearActiveStep();
     const div = document.createElement("div");
     div.className = "error-banner";
     div.textContent = text;
@@ -165,9 +310,12 @@
 
   function renderConfirmChange(change, autoApproved) {
     if (autoApproved) {
-      appendSubAction("✓ Auto-approved: " + change.path, "ok");
+      pendingChangesByPath.delete(change.path);
+      resolveStep("ok", (content) => buildChangeContent(content, change));
+      setActiveStep("Thinking...");
       return;
     }
+    setActiveStep("Waiting for your approval...");
     const box = makeApprovalBox();
     const title = document.createElement("div");
     title.textContent = (change.kind === "create" ? "New file: " : "Modified file: ") + change.path;
@@ -187,6 +335,7 @@
   }
 
   function renderConfirmCommand(command) {
+    setActiveStep("Waiting for your approval...");
     const box = makeApprovalBox();
     const title = document.createElement("div");
     title.textContent = "Agent wants to run: " + command.program + " " + (command.args || []).join(" ");
@@ -200,6 +349,7 @@
   }
 
   function renderConfirmGitOperation(op) {
+    setActiveStep("Waiting for your approval...");
     const box = makeApprovalBox();
     const title = document.createElement("div");
     let approveLabel = "Approve";
@@ -246,9 +396,11 @@
 
   function renderConfirmPlan(plan, autoApproved) {
     if (autoApproved) {
-      appendSubAction("✓ Auto-approved plan: " + plan.goal, "ok");
+      appendTimelineStep("✓ Auto-approved plan: " + plan.goal, "ok");
+      setActiveStep("Thinking...");
       return;
     }
+    setActiveStep("Waiting for your approval...");
     const box = makeApprovalBox();
     const title = document.createElement("div");
     title.textContent = "Proposed plan: " + plan.goal;
@@ -262,58 +414,85 @@
   function handleAgentEvent(event) {
     switch (event.type) {
       case "tool_call":
-        appendSubAction(event.display, "ok");
+        appendTimelineStep(event.display, "ok");
+        setActiveStep("Thinking...");
         return;
       case "tool_error":
-        appendSubAction(event.message, "error");
+        appendTimelineStep(event.message, "error");
+        setActiveStep("Thinking...");
         return;
       case "repetition_detected":
-        appendSubAction(
+        appendTimelineStep(
           "Repeated " + event.name + " call " + event.count + " times without progress -- asked the agent to change approach.",
           "error"
         );
+        setActiveStep("Thinking...");
         return;
       case "confirm":
+        pendingChangesByPath.set(event.change.path, event.change);
         renderConfirmChange(event.change, event.auto_approved);
         return;
-      case "change_applied":
-        appendSubAction("Change applied: " + event.path, "ok");
+      case "change_applied": {
+        const change = pendingChangesByPath.get(event.path);
+        pendingChangesByPath.delete(event.path);
+        resolveStep("ok", (content) => {
+          if (change) {
+            buildChangeContent(content, change);
+          } else {
+            buildSimpleLabel(content, "Change applied: " + event.path);
+          }
+        });
+        setActiveStep("Thinking...");
         return;
+      }
       case "change_rejected":
-        appendSubAction("Change rejected: " + event.path, "rejected");
+        pendingChangesByPath.delete(event.path);
+        resolveStep("rejected", (content) => buildSimpleLabel(content, "Change rejected: " + event.path));
+        setActiveStep("Thinking...");
         return;
       case "confirm_command":
+        pendingCommand = event.command;
         renderConfirmCommand(event.command);
         return;
       case "command_started":
-        appendSubAction("Running " + event.display + "...", "pending");
+        setActiveStep("Running " + event.display + "...");
         return;
       case "command_result": {
         const r = event.result;
-        const label = r.timed_out ? "Command timed out" : "Command finished (exit " + r.exit_code + ")";
-        appendSubAction(label, r.timed_out || r.exit_code ? "error" : "ok");
+        const ok = !(r.timed_out || r.exit_code);
+        const resultLabel = r.timed_out ? "Command timed out" : "Exit code " + r.exit_code;
+        const cmd = pendingCommand;
+        pendingCommand = null;
+        resolveStep(ok ? "ok" : "error", (content) => buildCommandContent(content, cmd, resultLabel));
+        setActiveStep("Thinking...");
         return;
       }
       case "command_rejected":
-        appendSubAction("Command not executed.", "rejected");
+        pendingCommand = null;
+        resolveStep("rejected", (content) => buildSimpleLabel(content, "Command not executed."));
+        setActiveStep("Thinking...");
         return;
       case "confirm_git_operation":
         renderConfirmGitOperation(event.operation);
         return;
       case "git_operation_applied":
-        appendSubAction(event.message, "ok");
+        appendTimelineStep(event.message, "ok");
+        setActiveStep("Thinking...");
         return;
       case "git_operation_rejected":
-        appendSubAction("Git operation not performed.", "rejected");
+        appendTimelineStep("Git operation not performed.", "rejected");
+        setActiveStep("Thinking...");
         return;
       case "confirm_plan":
         renderConfirmPlan(event.plan, event.auto_approved);
         return;
       case "plan_approved":
-        appendSubAction("Plan approved.", "ok");
+        appendTimelineStep("Plan approved.", "ok");
+        setActiveStep("Thinking...");
         return;
       case "plan_rejected":
-        appendSubAction("Plan not approved.", "rejected");
+        appendTimelineStep("Plan not approved.", "rejected");
+        setActiveStep("Thinking...");
         return;
       case "content":
         appendAgentContent(event.text);
@@ -322,9 +501,8 @@
         setFinalAgentText(event.text);
         return;
       case "retry":
-        appendSubAction(
-          "Connection to Ollama failed (" + event.reason + "). Retrying (" + event.attempt + "/" + (event.max_attempts - 1) + ")...",
-          "pending"
+        setActiveStep(
+          "Connection to Ollama failed (" + event.reason + "). Retrying (" + event.attempt + "/" + (event.max_attempts - 1) + ")..."
         );
         return;
       case "error":
@@ -448,6 +626,7 @@
         taskProgressEl.classList.remove("visible");
         currentAgentParagraph = null;
         pendingApprovalBox = null;
+        resetTimelineForNewTurn();
         return;
       default:
         return;

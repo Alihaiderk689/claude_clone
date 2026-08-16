@@ -85,16 +85,98 @@ body {
 .message.user .role { color: var(--vscode-textLink-foreground); }
 .message.agent .role { color: var(--vscode-charts-purple, #b180d7); }
 
-.sub-action {
-  display: block;
-  margin: 2px 0 2px 12px;
-  color: var(--vscode-descriptionForeground);
+.timeline {
+  margin: 4px 0 4px 12px;
+}
+
+.timeline-item {
+  position: relative;
+  padding: 3px 0 3px 20px;
   font-size: 0.9em;
 }
-.sub-action.error { color: var(--vscode-errorForeground); }
-.sub-action.ok::before { content: "✓ "; }
-.sub-action.pending::before { content: "→ "; }
-.sub-action.rejected::before { content: "✗ "; }
+
+/* The connecting vertical line -- one continuous line across stacked
+   siblings, stopped exactly at the first/last dot's center so it never
+   overflows past either end. */
+.timeline-item::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--vscode-panel-border);
+}
+.timeline-item:first-child::before { top: 10px; }
+.timeline-item:last-child::before { bottom: calc(100% - 10px); }
+
+.timeline-dot {
+  position: absolute;
+  left: 2px;
+  top: 7px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--vscode-descriptionForeground);
+}
+.timeline-item.error .timeline-dot { background: var(--vscode-testing-iconFailed, #f85149); }
+.timeline-item.rejected .timeline-dot { background: var(--vscode-descriptionForeground); opacity: 0.6; }
+
+.timeline-content { color: var(--vscode-foreground); }
+.timeline-label b { font-weight: 600; }
+.timeline-item.rejected .timeline-label { text-decoration: line-through; opacity: 0.7; }
+
+.timeline-meta {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
+  margin-top: 1px;
+}
+
+.timeline-preview {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.85em;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  color: var(--vscode-editor-foreground);
+}
+
+/* The currently-active step: a pulsing plus/cross icon instead of a plain
+   dot, built from two bars -- no icon font/image needed. */
+.timeline-item.active .timeline-label {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+.timeline-item.active .timeline-dot {
+  background: transparent;
+  width: 10px;
+  height: 10px;
+  left: 1px;
+  top: 6px;
+  border-radius: 0;
+  animation: timeline-pulse 1.3s ease-in-out infinite;
+}
+.timeline-item.active .timeline-dot::before,
+.timeline-item.active .timeline-dot::after {
+  content: "";
+  position: absolute;
+  background: var(--vscode-charts-orange, #cc6633);
+  border-radius: 1px;
+}
+.timeline-item.active .timeline-dot::before { left: 4px; top: 0; width: 2px; height: 10px; }
+.timeline-item.active .timeline-dot::after { left: 0; top: 4px; width: 10px; height: 2px; }
+
+@keyframes timeline-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .timeline-item.active .timeline-dot { animation: none; }
+}
 
 .file-link {
   color: var(--vscode-textLink-foreground);
