@@ -193,6 +193,72 @@ class TestToolCallThenFinalAnswer:
         assert final_events[0]["text"] == "I can't do that yet."
 
 
+class TestReadFileCacheIntegration:
+    """Phase 9: a real second read_file of the same unchanged path within a
+    turn short-circuits via the registry's cache-hit path, and the message
+    appended to history carries the cache_hit marker compact_messages relies
+    on -- see TestCompactMessagesCacheHitAware in test_context_manager.py
+    for the compaction-side half of this."""
+
+    def test_second_read_in_the_same_turn_is_a_cache_hit(self, registry, task_state):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        read_call = [{"function": {"name": "read_file", "arguments": {"path": "backend/auth.py"}}}]
+        client.chat.side_effect = [
+            updates(("", read_call, True)),
+            updates(("", read_call, True)),
+            updates(("Done.", None, True)),
+        ]
+
+        messages = [{"role": "user", "content": "read auth.py twice"}]
+        events = list(run_agent_turn(client, registry, messages, task_state=task_state))
+
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_messages) == 2
+        assert "class JWTAuth" in tool_messages[0]["content"]
+        assert tool_messages[0].get("cache_hit") is None
+        assert "unchanged since you last read it" in tool_messages[1]["content"]
+        assert tool_messages[1].get("cache_hit") is True
+
+        tool_call_events = [e for e in events if e["type"] == "tool_call"]
+        assert len(tool_call_events) == 2
+
+
+class TestMaxContextCharsOverride:
+    """Phase 9: max_context_chars is threaded straight through to
+    context_manager.compact_messages() every iteration -- confirm an
+    override actually changes trimming behavior, not just that the default
+    leaves things unchanged (already covered by every other test here)."""
+
+    def test_small_override_trims_old_tool_messages_the_default_would_not(self, registry, task_state):
+        from agent.context_manager import _TRIMMED_PLACEHOLDER
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = [updates(("Done.", None, True))]
+
+        # 8 pre-existing large tool messages, older than keep_recent's
+        # protected window (6) -- compact_messages runs at the top of the
+        # very first iteration, before any chat() call, so this needs no
+        # tool_calls from the mocked model at all.
+        messages = [{"role": "system", "content": "Base."}]
+        for i in range(8):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "list_files", "arguments": {"path": f"dir{i}"}}}],
+                }
+            )
+            messages.append({"role": "tool", "tool_name": "list_files", "content": "x" * 500})
+        messages.append({"role": "user", "content": "what's next?"})
+        # 8 * 500 = 4,000 chars total -- comfortably under the real default
+        # budget (12,000), so the default would leave every message alone.
+
+        list(run_agent_turn(client, registry, messages, task_state=task_state, max_context_chars=10))
+
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert any(m["content"] == _TRIMMED_PLACEHOLDER for m in tool_messages)
+
+
 class TestFallbackToolCallParsing:
     """Ollama doesn't always lift qwen2.5-coder's tool call into the
     structured `tool_calls` response field -- it can arrive as plain
@@ -683,6 +749,83 @@ class TestApprovalFlow:
         assert len(tool_error_events) == 1
         assert "changed on disk" in tool_error_events[0]["message"].lower()
 
+    def test_auto_approve_edits_applies_without_the_caller_answering(self, project, registry):
+        """The core safety property of Auto mode: the approval decision is
+        resolved *inside* run_agent_turn, not by whatever the caller sends
+        back. This driver deliberately never provides a real decision
+        (always sends None back) to prove the edit still applies."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": {
+                                "path": "backend/auth.py",
+                                "old_text": "pass",
+                                "new_text": "pass  # auto-approved",
+                            },
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+        second_call = updates(("Done.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "tweak auth.py"}]
+        gen = run_agent_turn(client, registry, messages, auto_approve_edits=True)
+
+        events = []
+        send_value = None
+        while True:
+            try:
+                event = gen.send(send_value)
+            except StopIteration:
+                break
+            events.append(event)
+            send_value = None  # never answer, even for a confirm-shaped event
+
+        confirm_events = [e for e in events if e["type"] == "confirm"]
+        applied_events = [e for e in events if e["type"] == "change_applied"]
+        assert len(confirm_events) == 1
+        assert confirm_events[0]["auto_approved"] is True
+        assert len(applied_events) == 1
+
+        on_disk = (project.root / "backend" / "auth.py").read_text()
+        assert "pass  # auto-approved" in on_disk
+
+    def test_manual_mode_confirm_event_has_no_auto_approved_field(self, project, registry):
+        """Default (auto_approve_edits=False) must be byte-for-byte the
+        existing event shape -- no stray `auto_approved` key appearing."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": {"path": "backend/auth.py", "old_text": "pass", "new_text": "pass  # x"},
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+        second_call = updates(("Done.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "tweak auth.py"}]
+        gen = run_agent_turn(client, registry, messages)
+        events = drive_agent_turn(gen, decisions=[True])
+
+        confirm_event = next(e for e in events if e["type"] == "confirm")
+        assert "auto_approved" not in confirm_event
+
 
 def _fake_terminal_proc(returncode=0, stdout="", stderr="", pid=99999):
     """Stand-in for subprocess.Popen used by agent/tools/terminal.py's
@@ -862,6 +1005,28 @@ class TestRunCommandApprovalFlow:
         rejected = [e for e in events if e["type"] == "command_rejected"]
         assert len(applied) == 1
         assert len(rejected) == 1
+
+    def test_auto_approve_edits_does_not_auto_approve_commands(self, registry):
+        """Auto mode's scope is edits/plans only -- a command must still
+        pause for an explicit decision even with auto_approve_edits=True,
+        and an unanswered/rejected one must not run."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "run_command", "arguments": {"program": "pytest", "args": []}}}], True),
+        )
+        second_call = updates(("Okay, not running it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        with mock.patch("agent.tools.terminal.subprocess.Popen") as mock_popen:
+            messages = [{"role": "user", "content": "run the tests"}]
+            gen = run_agent_turn(client, registry, messages, auto_approve_edits=True)
+            events = drive_agent_turn(gen, decisions=[False])
+
+        mock_popen.assert_not_called()
+        confirm_events = [e for e in events if e["type"] == "confirm_command"]
+        assert len(confirm_events) == 1
+        assert "auto_approved" not in confirm_events[0]
+        assert any(e["type"] == "command_rejected" for e in events)
 
 
 def _run_git(repo_root, *args):
@@ -1077,6 +1242,33 @@ class TestGitApprovalFlow:
         assert staged == ["README.md"]
         assert unstaged == ["backend/auth.py"]
 
+    def test_auto_approve_edits_does_not_auto_approve_git_operations(self, git_repo, git_registry):
+        """Auto mode's scope is edits/plans only -- a Git operation must
+        still pause for an explicit decision even with
+        auto_approve_edits=True, and a rejected one must not run."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "git_create_branch", "arguments": {"name": "feature/x"}}}], True),
+        )
+        second_call = updates(("Okay, not creating it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "create a branch"}]
+        gen = run_agent_turn(client, git_registry, messages, auto_approve_edits=True)
+        events = drive_agent_turn(gen, decisions=[False])
+
+        confirm_events = [e for e in events if e["type"] == "confirm_git_operation"]
+        assert len(confirm_events) == 1
+        assert "auto_approved" not in confirm_events[0]
+        assert any(e["type"] == "git_operation_rejected" for e in events)
+
+        import subprocess
+
+        branches = subprocess.run(
+            ["git", "branch", "--list", "feature/x"], cwd=str(git_repo), capture_output=True, text=True
+        ).stdout
+        assert "feature/x" not in branches
+
 
 class TestPlanApprovalFlow:
     """Phase 6's planning mechanism reuses the same propose/confirm/adopt
@@ -1204,6 +1396,48 @@ class TestPlanApprovalFlow:
         list(drive_agent_turn(gen))
 
         assert "backend/auth.py" in task_state.files_inspected
+
+    def test_auto_approve_edits_adopts_plan_without_the_caller_answering(self, registry, task_state):
+        """Same safety property as the edit case: a driver that never
+        provides a real decision still gets the plan adopted, because
+        auto_approve_edits resolves it internally."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "create_plan",
+                            "arguments": {"goal": "Add JWT authentication", "steps": ["a", "b"]},
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+        second_call = updates(("Here's my plan.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "Add JWT authentication"}]
+        gen = run_agent_turn(client, registry, messages, task_state=task_state, auto_approve_edits=True)
+
+        events = []
+        send_value = None
+        while True:
+            try:
+                event = gen.send(send_value)
+            except StopIteration:
+                break
+            events.append(event)
+            send_value = None  # never answer
+
+        confirm_events = [e for e in events if e["type"] == "confirm_plan"]
+        approved_events = [e for e in events if e["type"] == "plan_approved"]
+        assert confirm_events[0]["auto_approved"] is True
+        assert len(approved_events) == 1
+        assert task_state.plan is not None
+        assert task_state.goal == "Add JWT authentication"
 
 
 class TestCancelEvent:

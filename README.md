@@ -1,10 +1,26 @@
-# code-agent (Phase 8)
+# code-agent (Phase 9)
 
 A local, free, Claude Code–style coding assistant that runs entirely on your own
 machine using [Ollama](https://ollama.com) and `qwen2.5-coder:3b`. No cloud API,
 no API key, no subscription.
 
-This is **Phase 8**: no new user-facing features. Phases 1–7 built the
+This is **Phase 9**: context, performance, and Qwen 3B optimization — no
+major new features (per this phase's own scope rules). A careful read of
+Phases 1–8's existing code found that most of the obvious wins (capping
+tool outputs, compacting old conversation, bounded task memory) were
+**already built**; Phase 9 closed the real, verified gaps instead of
+rebuilding what was already there: an unchanged file is no longer resent
+in full on a second read within the same task, tool output caps now cover
+`git_status` (previously the one uncapped one), task memory is bounded in
+storage as well as in what it displays, a `--debug`-gated performance
+summary reports context size/LLM-call count/cache hits per turn, and the
+Phase 8 benchmark harness gained real LLM-call/context-size/time-to-first-
+token/memory metrics plus two new tasks and a `--compare` mode for
+honest before/after numbers. See "Phase 9: Context, Performance & Qwen 3B
+Optimization" below for the full picture, including what was deliberately
+evaluated and left unchanged.
+
+Phase 8 (still fully in effect): no new user-facing features. Phases 1–7 built the
 agent's capabilities (inspection, editing, terminal, Git, planning, VS
 Code); Phase 8 makes all of that **reliable** — a failing tool, a dropped
 Ollama connection, a malformed model response, a stuck loop, or a user
@@ -130,17 +146,20 @@ completely unaffected by this and keeps working exactly as it always has.
 
 ## Configuration
 
-Both settings are optional; sensible defaults are used if unset.
+All settings are optional; sensible defaults are used if unset. `code-agent serve` reads the
+same ones.
 
-| Variable        | Default                 | Purpose                          |
-|-----------------|--------------------------|-----------------------------------|
-| `OLLAMA_MODEL`  | `qwen2.5-coder:3b`       | Which Ollama model to chat with  |
-| `OLLAMA_HOST`   | `http://localhost:11434` | Base URL of the Ollama server    |
+| Variable                        | Default                  | Purpose                                                  |
+|----------------------------------|---------------------------|-----------------------------------------------------------|
+| `OLLAMA_MODEL`                  | `qwen2.5-coder:3b`       | Which Ollama model to chat with                          |
+| `OLLAMA_HOST`                   | `http://localhost:11434` | Base URL of the Ollama server                             |
+| `OLLAMA_TIMEOUT`                | `120` (seconds)           | How long to wait for a single Ollama response before treating it as failed and retrying. Raise this if you're on slower hardware or a larger model (e.g. 7B) and see repeated "Connection to Ollama failed... Retrying" messages that a real `ollama ps` shows was still actively generating. |
+| `CODE_AGENT_MAX_CONTEXT_CHARS`  | `12000` (chars)           | The whole-conversation character budget `compact_messages()` trims old tool output down to before it's sent to Ollama (see "Phase 9" below). Lower it on tighter memory, raise it if you have RAM to spare and want the model to keep more history verbatim. |
 
 Example:
 
 ```bash
-OLLAMA_MODEL=qwen2.5-coder:3b OLLAMA_HOST=http://localhost:11434 code-agent
+OLLAMA_MODEL=qwen2.5-coder:3b OLLAMA_HOST=http://localhost:11434 OLLAMA_TIMEOUT=240 code-agent
 ```
 
 ## Example usage
@@ -627,6 +646,24 @@ You > /new
 Started a new task. Project files and Git history are untouched.
 ```
 
+**`/auto` and `/manual`** switch the approval mode for the rest of the session (VS Code has the
+same toggle as two buttons in the panel's status bar instead of slash commands). Manual is the
+default and behaves exactly as described above — every edit, command, and Git operation asks
+first. Auto auto-approves file edits and plan approvals only, so a multi-step edit no longer stops
+for a click/Enter on every single file; **`run_command` and every Git operation (branch, stage,
+commit, push) still ask for approval every single time, in both modes, with no way to turn that
+off.** Switching modes only affects turns from that point on — it doesn't retroactively change
+anything already pending:
+
+```
+You > /auto
+Auto mode on: file edits and plans apply without asking. Commands and Git operations still ask
+every time. Switch back with /manual.
+
+You > /manual
+Manual mode on: every edit, command, and Git operation asks again.
+```
+
 **Interrupting a task** (Ctrl+C) preserves whatever task state exists so
 far instead of just silently dropping it:
 
@@ -850,6 +887,7 @@ boundary and cannot bypass any of it.
 | `/task/status` | GET | `?workspace_root=...` → the current goal, plan, files inspected/modified, recent commands, errors, and Git actions for that workspace. |
 | `/task/stop` | POST | `{workspace_root}` — sets that workspace's cancellation flag; a turn in progress (or paused on an approval) stops at the next safe point and yields `{"type": "cancelled"}`. |
 | `/task/new` | POST | `{workspace_root}` — same as the CLI's `/new`: resets the conversation, plan, and task memory for that workspace. Does not touch project files or Git history. |
+| `/task/mode` | POST | `{workspace_root, mode}` where `mode` is `"manual"` or `"auto"` — same as the CLI's `/auto`/`/manual`. Auto only auto-approves file edits and plan approvals; `run_command` and every Git operation still always require approval regardless of mode (see "Security" above). Persists across `/task/new`, resets to `"manual"` only when a session is first created. |
 
 ### Cancellation (Stop Task)
 
@@ -914,15 +952,21 @@ Commands (Command Palette and, where noted, editor context menu):
   conversation view.
 
 In the chat panel: a ● Connected / ○ Offline indicator and the configured
-model name (both read from `/health`, never hardcoded); sub-action
-checkmarks under each agent turn (e.g. "✓ Read auth.py"); proposed edits
-show **View Diff** (native diff editor) plus **Approve**/**Reject**;
-proposed commands show **Run**/**Reject** with the working directory;
-proposed Git operations show **Stage**/**Commit**/**Create Branch** plus
-**Cancel**; file references like `backend/auth.py:42` in agent replies are
-clickable and open that file at that line; and a task-progress panel
-mirrors the current plan and modified-files list, refreshed after each
-relevant event via `/task/status`.
+model name (both read from `/health`, never hardcoded); a **Manual**/**Auto**
+toggle in the status bar (`POST /task/mode`, reflected back via
+`/task/status`) — Auto auto-approves file edits and plan approvals only,
+rendered as a "✓ Auto-approved" line instead of buttons; proposed commands
+and Git operations always show their normal approval prompt regardless of
+this toggle (see "Security" above for the exact scope); sub-action
+checkmarks under each agent turn (e.g. "✓ Read auth.py"); proposed edits in
+Manual mode show **View Diff** (native diff editor) plus
+**Approve**/**Reject**; proposed commands show **Run**/**Reject** with the
+working directory; proposed Git operations show
+**Stage**/**Commit**/**Create Branch** plus **Cancel**; file references like
+`backend/auth.py:42` in agent replies are clickable and open that file at
+that line; and a task-progress panel mirrors the current plan and
+modified-files list, refreshed after each relevant event via
+`/task/status`.
 
 ## Reliability and Failure Recovery
 
@@ -1041,7 +1085,19 @@ interleaves with the Rich-rendered conversation on stdout); pass
 failure's classification, every retry attempt, every repetition
 interception, and (in server mode) a short random request ID per HTTP
 request for correlating a client-visible error with the matching server
-log line. Every log line is passed through a redaction filter that
+log line. As of Phase 9, every turn also logs one performance summary line
+at the end (via the same `--debug`/`CODE_AGENT_DEBUG=1` gate), e.g.:
+
+```
+context=6412 tokens (25648 chars) llm_calls=3 tool_calls=7 cache=4 hits/1 misses compaction=1 superseded/0 stale/2 trimmed
+```
+
+— estimated context size (both the rough token estimate and the real
+character count `compact_messages()` actually enforces against), how many
+times the model was called, how many tool calls were made, how many
+`read_file` calls were served from the unchanged-file cache versus
+actually re-read, and how many old messages `compact_messages()`
+superseded/marked stale/trimmed this turn. Every log line is passed through a redaction filter that
 recognizes common secret shapes (`Bearer <token>`, `token=`/`password=`/
 `api_key=`-style key-value pairs) before being written — not a substitute
 for the actual guarantee (nothing in this codebase logs raw request
@@ -1100,21 +1156,45 @@ external telemetry, nothing leaves the machine. It drives the exact same
 `run_agent_turn()` the CLI and HTTP server use against a real local Ollama
 server and a fresh temporary Git-repo fixture project, auto-approving
 every confirm* prompt (the one deliberate difference from real usage,
-since there's no human in the loop for an unattended run). Six tasks:
-explain repository structure, find a known bug, modify a function, add a
-test, run tests and fix a failure, and a multi-step change (fix the bug
-*and* run tests). For each task it records success/failure (checked
-against real file/Git/test-exit-code state, not just "did it produce
-text"), wall-clock duration, tool-call count, retry count, and prompt/
-completion token counts when Ollama reports them. Run it with:
+since there's no human in the loop for an unattended run). Eight tasks as
+of Phase 9 (six from Phase 8 plus two added for this phase): explain
+repository structure, find a known bug, modify a function, add a test, run
+tests and fix a failure, a multi-step change (fix the bug *and* run
+tests), **relevant file selection** (a fixture salted with deliberately
+irrelevant noise files — `frontend/`, `package-lock.json`, `vendor/` — the
+task fails if any tool call actually reads/edits into one of them, not
+just if the model mentions them), and **stuck/repetition recovery** (a
+request whose literal target text doesn't exist in the file, designed to
+provoke Phase 8's repetition-detection mechanism; passes if the turn
+recovers with a clean answer instead of exhausting the iteration budget).
+For each task it records success/failure (checked against real
+file/Git/test-exit-code state, not just "did it produce text"),
+wall-clock duration, tool-call count, retry count, prompt/completion
+token counts when Ollama reports them, and — new in Phase 9 — the number
+of real LLM round-trips, the largest context size sent on any single call
+(both raw chars and an estimated token count), time to the first streamed
+update, and process peak RSS at that point. Run it with:
 
 ```bash
 python -m agent.benchmark --output benchmark_report.json
 ```
 
-This is a baseline measurement for the 3B model, not an optimization
-pass — Phase 8 deliberately does not tune the model or its prompting based
-on these results; that's explicitly Phase 9's job.
+Compare two saved reports (e.g. a baseline captured before a change and a
+report captured after) without re-running anything:
+
+```bash
+python -m agent.benchmark --compare before.json after.json
+```
+
+This tolerates a report saved before Phase 9 changed the JSON shape (a
+bare array of tasks) as well as the current `{"model", "host",
+"timestamp", "tasks": [...]}` shape — a genuine pre-Phase-9 baseline still
+works as the "before" side.
+
+This remains a baseline measurement for the 3B model, not a model-tuning
+pass — Phase 9 optimized the surrounding agent architecture (context
+management, caching, tool-output handling), not the model or its
+prompting/fine-tuning, per this phase's own explicit scope.
 
 ## Security
 
@@ -1167,6 +1247,82 @@ Adopting a plan cannot skip or pre-approve any of the real actions above;
 each one it leads to still pauses for its own separate, default-*reject*
 approval. `update_plan`/`get_plan` only ever read or write step statuses on
 an already-approved plan held in memory.
+
+**Auto mode changes none of this either.** The Manual/Auto toggle (`/auto`/
+`/manual` in the CLI, the status-bar buttons in VS Code — see "`/new`"
+above) only affects whether a file-edit or plan-approval prompt is skipped;
+it is implemented as an additive `auto_approve_edits` flag on
+`run_agent_turn()` that the `confirm_command` and `confirm_git_operation`
+code paths never receive. Concretely: **`run_command` and every Git
+operation — branch, stage, commit, and push — always require individual
+approval, in both modes, with no setting anywhere that changes that.**
+Switching to Auto never bypasses the command allowlist, the Git operation
+validation, or any of the guarantees above; it only removes the prompt for
+actions that were already locally reversible (a file diff, an inert plan).
+
+## Phase 9: Context, Performance & Qwen 3B Optimization
+
+Phase 9's scope was deliberately narrow: context/prompt/tool-call
+efficiency and Qwen 3B effectiveness on the target 8 GB hardware — no
+major new features, no model changes, no fine-tuning, no RAG. The first
+step was a genuine baseline (see "Qwen 3B benchmark" above): running the
+*unmodified* Phase 8 code against a real local `qwen2.5-coder:3b` before
+touching anything. A careful read of the existing code first, though,
+found that most of what a first pass at this phase might have built
+already existed — `context_manager.py`'s 12,000-char conversation budget
+with a protected recent-message floor, retroactive stale/superseded
+`read_file` placeholdering, bounded `TaskState.summarize()` display, and
+per-tool output caps on nearly everything (`run_command`, `git_diff`,
+`git_log`, `read_file`, `list_files`, `search_files`). Phase 9 closed the
+gaps that read actually found, rather than rebuilding any of that:
+
+- **Unchanged-file read cache**: a second full `read_file` of a path
+  already inspected and unchanged since (checked against the existing
+  `FileStateTracker` hash and `TaskState.files_inspected`) returns a short
+  "unchanged since you last read it" notice instead of resending the
+  whole file — with a `force=true` escape hatch. This required fixing a
+  subtle interaction with the existing stale/superseded compaction pass
+  (a cache-hit stub must never cause the *real* earlier copy of a file to
+  be superseded away) — see CLAUDE.md's Phase 9 section for the exact
+  mechanism if you're extending this.
+- **`git_status`** gained an entry cap (`MAX_STATUS_ENTRIES_PER_CATEGORY`)
+  — it was the one tool output with no ceiling at all before this phase.
+- **`TaskState`'s list storage** is now bounded at the source
+  (`_MAX_STORED = 50`), not just at what `summarize()` chooses to display
+  — a real memory ceiling for a long-running task.
+- **A `--debug`-gated performance summary** logs once per turn: estimated
+  context size (tokens and chars), LLM-call count, tool-call count, cache
+  hits/misses, and how much `compact_messages()` actually trimmed —
+  reusing Phase 8's existing logging plumbing rather than a new event type.
+- **A lightweight token estimator** (`agent/context_budget.py`,
+  `len(text) / 4`) for that debug line and the benchmark's context-size
+  metric — reporting only, it does not replace the proven char-based
+  budget enforcement.
+- **`CODE_AGENT_MAX_CONTEXT_CHARS`** makes the conversation budget
+  configurable, following the exact pattern `OLLAMA_TIMEOUT` already set.
+- **A short tool-selection guidance paragraph** added to the system
+  prompt (request type → tool), instead of rewriting any of the 16
+  existing tool descriptions — those were already concise and shaped by
+  real live-testing of Qwen's tool-calling quirks; shrinking them risked
+  the exact reliability regression this phase's own rules say to avoid.
+- **The benchmark harness** gained real LLM-call/context-size/
+  time-to-first-token/memory metrics, two new tasks (relevant file
+  selection under a noisy fixture; stuck/repetition recovery), run
+  metadata in its JSON report, and a `--compare` mode for honest
+  before/after numbers.
+
+**Explicitly evaluated and left unchanged, with reasons** (don't
+re-attempt these without a specific reason the tradeoff below no longer
+holds): reordering the raw conversation by "priority category" — would
+break the existing tool-call/tool-result pairing `compact_messages()`
+depends on, a correctness risk far outweighing any latency gain, whereas
+the system prompt's own section order is where a consistent order safely
+applies; rewriting tool descriptions to be shorter — already concise,
+already shaped by real reliability testing; partial (head+tail) truncation
+in `compact_messages`'s size-based trimming pass — the existing
+all-or-nothing placeholder approach is simple, tested, and already points
+back at the `TaskState` summary rather than risking a misleading partial
+fragment.
 
 ## What is implemented now (Phase 8)
 
@@ -1306,7 +1462,8 @@ Everything from Phases 1–5, plus:
   exit — no vector database, no embeddings)
 - A standalone web application or mobile application (VS Code's native
   Webview is the only UI surface added in Phase 7)
-- Any additional CLI/chat commands beyond `exit` / `quit` / `/new`
+- Any additional CLI/chat commands beyond `exit` / `quit` / `/new` /
+  `/auto` / `/manual` (e.g. no `/help`, no `/model`, no in-chat settings)
 - Batched upfront review of multiple proposed changes/commands (each is
   currently reviewed as it's proposed, not pre-planned as a numbered set)
 - Installing dependencies automatically, running arbitrary scripts beyond the

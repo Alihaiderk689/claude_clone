@@ -15,6 +15,8 @@
   const sendBtn = document.getElementById("send-btn");
   const stopBtn = document.getElementById("stop-task-btn");
   const newTaskBtn = document.getElementById("new-task-btn");
+  const modeManualBtn = document.getElementById("mode-manual-btn");
+  const modeAutoBtn = document.getElementById("mode-auto-btn");
 
   const FILE_REF_RE = /([A-Za-z0-9_][A-Za-z0-9_\-./]*\.[A-Za-z]{1,10}):(\d+)/g;
 
@@ -161,7 +163,11 @@
     box.appendChild(actions);
   }
 
-  function renderConfirmChange(change) {
+  function renderConfirmChange(change, autoApproved) {
+    if (autoApproved) {
+      appendSubAction("✓ Auto-approved: " + change.path, "ok");
+      return;
+    }
     const box = makeApprovalBox();
     const title = document.createElement("div");
     title.textContent = (change.kind === "create" ? "New file: " : "Modified file: ") + change.path;
@@ -238,7 +244,11 @@
     addActions(box, approveLabel, "Cancel");
   }
 
-  function renderConfirmPlan(plan) {
+  function renderConfirmPlan(plan, autoApproved) {
+    if (autoApproved) {
+      appendSubAction("✓ Auto-approved plan: " + plan.goal, "ok");
+      return;
+    }
     const box = makeApprovalBox();
     const title = document.createElement("div");
     title.textContent = "Proposed plan: " + plan.goal;
@@ -264,7 +274,7 @@
         );
         return;
       case "confirm":
-        renderConfirmChange(event.change);
+        renderConfirmChange(event.change, event.auto_approved);
         return;
       case "change_applied":
         appendSubAction("Change applied: " + event.path, "ok");
@@ -297,7 +307,7 @@
         appendSubAction("Git operation not performed.", "rejected");
         return;
       case "confirm_plan":
-        renderConfirmPlan(event.plan);
+        renderConfirmPlan(event.plan, event.auto_approved);
         return;
       case "plan_approved":
         appendSubAction("Plan approved.", "ok");
@@ -331,7 +341,15 @@
     }
   }
 
+  function setMode(mode) {
+    modeManualBtn.classList.toggle("active", mode !== "auto");
+    modeAutoBtn.classList.toggle("active", mode === "auto");
+  }
+
   function renderTaskStatus(status) {
+    if (status && status.mode) {
+      setMode(status.mode);
+    }
     taskProgressEl.textContent = "";
     const hasPlan = status && status.plan;
     const hasFiles =
@@ -393,6 +411,14 @@
   });
   stopBtn.addEventListener("click", () => vscode.postMessage({ type: "stopTask" }));
   newTaskBtn.addEventListener("click", () => vscode.postMessage({ type: "newTask" }));
+  modeManualBtn.addEventListener("click", () => {
+    setMode("manual");
+    vscode.postMessage({ type: "setMode", mode: "manual" });
+  });
+  modeAutoBtn.addEventListener("click", () => {
+    setMode("auto");
+    vscode.postMessage({ type: "setMode", mode: "auto" });
+  });
 
   window.addEventListener("message", (event) => {
     const msg = event.data;

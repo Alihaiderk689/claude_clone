@@ -28,6 +28,20 @@ MAX_FILES_IN_SUMMARY = 10
 MAX_COMMANDS_IN_SUMMARY = 5
 MAX_ERRORS_IN_SUMMARY = 3
 
+# Phase 9: bounds the underlying *storage* too, not just summarize()'s
+# display slice -- without this, a long-running task's lists (especially
+# commands_executed/errors_encountered/git_operations, which only ever grow)
+# would hold an unbounded number of Python objects for the life of the
+# process even though only the last few of each are ever shown. Comfortably
+# larger than any of the MAX_*_IN_SUMMARY caps so nothing display-relevant
+# is ever lost before it would have scrolled out of the summary anyway.
+_MAX_STORED = 50
+
+
+def _trim(items: list) -> None:
+    if len(items) > _MAX_STORED:
+        del items[: len(items) - _MAX_STORED]
+
 
 @dataclass
 class CommandRecord:
@@ -59,10 +73,12 @@ class TaskState:
         if path in self.files_inspected:
             self.files_inspected.remove(path)
         self.files_inspected.append(path)
+        _trim(self.files_inspected)
 
     def note_file_modified(self, path: str) -> None:
         if path not in self.files_modified:
             self.files_modified.append(path)
+            _trim(self.files_modified)
         # A file that changed needs to be re-read before it can be trusted
         # again -- drop any "already inspected" record for it (see
         # context_manager.py, which also invalidates the raw conversation
@@ -72,12 +88,15 @@ class TaskState:
 
     def note_command(self, record: CommandRecord) -> None:
         self.commands_executed.append(record)
+        _trim(self.commands_executed)
 
     def note_error(self, message: str) -> None:
         self.errors_encountered.append(message)
+        _trim(self.errors_encountered)
 
     def note_git_operation(self, message: str) -> None:
         self.git_operations.append(message)
+        _trim(self.git_operations)
 
     def has_content(self) -> bool:
         return bool(

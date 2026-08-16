@@ -116,6 +116,17 @@ function startFakeServer(): Promise<{ server: http.Server; port: number; token: 
         res.end(JSON.stringify({ ok: true }));
         return;
       }
+      if (req.url === "/task/mode" && req.method === "POST") {
+        let raw = "";
+        req.setEncoding("utf8");
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          const parsed = JSON.parse(raw);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, mode: parsed.mode }));
+        });
+        return;
+      }
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
     });
@@ -171,6 +182,12 @@ describe("AgentClient against a fake local server", () => {
     assert.deepEqual(await client.taskStop("/x"), { ok: true });
     assert.deepEqual(await client.taskNew("/x"), { ok: true });
     assert.deepEqual(await client.chatConfirm("/x", true), { ok: true });
+  });
+
+  test("setMode() posts to /task/mode with the workspace root and mode", async () => {
+    const client = new AgentClient(tokenFile);
+    assert.deepEqual(await client.setMode("/x", "auto"), { ok: true, mode: "auto" });
+    assert.deepEqual(await client.setMode("/x", "manual"), { ok: true, mode: "manual" });
   });
 
   test("wrong token raises AgentAuthError", async () => {

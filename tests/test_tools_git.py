@@ -15,6 +15,7 @@ import pytest
 
 from agent.project import ProjectRoot
 from agent.tools.git import (
+    MAX_STATUS_ENTRIES_PER_CATEGORY,
     apply_git_operation,
     build_git_commit_tool,
     build_git_create_branch_tool,
@@ -143,6 +144,15 @@ class TestGitStatus:
         result = build_git_status_tool(project).execute({})
         assert "Staged:" in result.output
         assert "README.md (deleted)" in result.output
+
+    def test_untracked_files_truncated_past_cap(self, project, repo):
+        for i in range(MAX_STATUS_ENTRIES_PER_CATEGORY + 25):
+            (repo / f"file_{i}.txt").write_text("x\n")
+        result = build_git_status_tool(project).execute({})
+        assert "Untracked:" in result.output
+        assert f"file_0.txt" in result.output
+        assert result.output.count("file_") == MAX_STATUS_ENTRIES_PER_CATEGORY
+        assert f"... truncated at {MAX_STATUS_ENTRIES_PER_CATEGORY} entries (25 more not shown)." in result.output
 
     def test_detached_head(self, project, repo):
         sha = subprocess.run(

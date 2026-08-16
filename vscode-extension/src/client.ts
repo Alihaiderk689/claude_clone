@@ -35,6 +35,8 @@ export interface HealthResponse {
 
 export type AgentEvent = { type: string; [key: string]: unknown };
 
+export type AgentMode = "manual" | "auto";
+
 export class AgentUnavailableError extends Error {}
 export class AgentAuthError extends Error {}
 
@@ -122,6 +124,15 @@ export class AgentClient {
   async taskNew(workspaceRoot: string): Promise<Record<string, unknown>> {
     const info = this.info();
     return this.requestJson(info, "POST", "/task/new", { workspace_root: workspaceRoot });
+  }
+
+  /** Manual (default) = every edit/plan/command/Git operation asks first,
+   * same as always. Auto = edits and plans apply without asking; commands
+   * and Git operations are NEVER affected by this and still always ask --
+   * see agent/loop.py's auto_approve_edits for the enforced scope. */
+  async setMode(workspaceRoot: string, mode: AgentMode): Promise<Record<string, unknown>> {
+    const info = this.info();
+    return this.requestJson(info, "POST", "/task/mode", { workspace_root: workspaceRoot, mode });
   }
 
   async chatConfirm(workspaceRoot: string, approved: boolean): Promise<Record<string, unknown>> {

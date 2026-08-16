@@ -37,3 +37,5 @@ server.json
 
 # Benchmark output
 benchmark_report.json
+benchmark_baseline*.json
+benchmark_after*.json

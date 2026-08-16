@@ -455,6 +455,118 @@ class TestTaskNew:
         assert refreshed.task_state.files_inspected == []
 
 
+class TestTaskMode:
+    def test_new_session_starts_in_manual_mode(self, server, workspace):
+        base_url, token = server
+        resp = requests.get(
+            f"{base_url}/task/status", params={"workspace_root": workspace}, headers=auth_headers(token), timeout=5
+        )
+        assert resp.json()["mode"] == "manual"
+
+    def test_setting_auto_mode_is_reflected_in_status(self, server, workspace):
+        base_url, token = server
+        resp = requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": workspace, "mode": "auto"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "mode": "auto"}
+
+        status = requests.get(
+            f"{base_url}/task/status", params={"workspace_root": workspace}, headers=auth_headers(token), timeout=5
+        )
+        assert status.json()["mode"] == "auto"
+
+    def test_switching_back_to_manual_works(self, server, workspace):
+        base_url, token = server
+        requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": workspace, "mode": "auto"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+        resp = requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": workspace, "mode": "manual"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+        assert resp.json()["mode"] == "manual"
+
+    def test_invalid_mode_value_rejected(self, server, workspace):
+        base_url, token = server
+        resp = requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": workspace, "mode": "yolo"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+        assert resp.status_code == 400
+
+        # Rejected value must not have been applied.
+        status = requests.get(
+            f"{base_url}/task/status", params={"workspace_root": workspace}, headers=auth_headers(token), timeout=5
+        )
+        assert status.json()["mode"] == "manual"
+
+    def test_missing_workspace_root_rejected(self, server):
+        base_url, token = server
+        resp = requests.post(
+            f"{base_url}/task/mode", json={"mode": "auto"}, headers=auth_headers(token), timeout=5
+        )
+        assert resp.status_code == 400
+
+    def test_requires_authentication(self, server, workspace):
+        base_url, _ = server
+        resp = requests.post(
+            f"{base_url}/task/mode", json={"workspace_root": workspace, "mode": "auto"}, timeout=5
+        )
+        assert resp.status_code == 401
+
+    def test_mode_survives_task_new(self, server, workspace):
+        """Mode is a session preference, not task data -- /task/new must
+        not reset it back to manual."""
+        base_url, token = server
+        requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": workspace, "mode": "auto"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+        requests.post(
+            f"{base_url}/task/new", json={"workspace_root": workspace}, headers=auth_headers(token), timeout=5
+        )
+        status = requests.get(
+            f"{base_url}/task/status", params={"workspace_root": workspace}, headers=auth_headers(token), timeout=5
+        )
+        assert status.json()["mode"] == "auto"
+
+    def test_mode_is_isolated_per_workspace(self, server, tmp_path):
+        base_url, token = server
+        ws_a = tmp_path / "project-a"
+        ws_b = tmp_path / "project-b"
+        ws_a.mkdir()
+        ws_b.mkdir()
+
+        requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": str(ws_a), "mode": "auto"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+
+        status_a = requests.get(
+            f"{base_url}/task/status", params={"workspace_root": str(ws_a)}, headers=auth_headers(token), timeout=5
+        )
+        status_b = requests.get(
+            f"{base_url}/task/status", params={"workspace_root": str(ws_b)}, headers=auth_headers(token), timeout=5
+        )
+        assert status_a.json()["mode"] == "auto"
+        assert status_b.json()["mode"] == "manual"
+
+
 class TestConfirmFlow:
     def test_edit_approval_round_trip(self, server, tmp_path):
         base_url, token = server
@@ -521,6 +633,60 @@ class TestConfirmFlow:
         types = [e["type"] for e in events_holder["events"]]
         assert "confirm" in types
         assert "change_applied" in types
+        assert (ws / "target.py").read_text() == "value = 2\n"
+
+    def test_auto_mode_applies_edit_without_a_chat_confirm_call(self, server, tmp_path):
+        """The end-to-end proof: with mode=auto, POST /chat alone (no
+        /chat/confirm at all) is enough for the edit to actually land on
+        disk."""
+        base_url, token = server
+        ws = tmp_path / "auto-editable"
+        ws.mkdir()
+        (ws / "target.py").write_text("value = 1\n")
+
+        requests.post(
+            f"{base_url}/task/mode",
+            json={"workspace_root": str(ws), "mode": "auto"},
+            headers=auth_headers(token),
+            timeout=5,
+        )
+
+        call_count = {"n": 0}
+
+        def fake_chat(self, messages, tools=None, cancel_event=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                yield {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "edit_file",
+                                "arguments": {
+                                    "path": "target.py",
+                                    "old_text": "value = 1\n",
+                                    "new_text": "value = 2\n",
+                                },
+                            }
+                        }
+                    ],
+                    "done": True,
+                }
+            else:
+                yield {"content": "Done.", "tool_calls": None, "done": True}
+
+        with mock.patch.object(OllamaClient, "chat", fake_chat):
+            resp = requests.post(
+                f"{base_url}/chat",
+                json={"workspace_root": str(ws), "message": "bump the value"},
+                headers=auth_headers(token),
+                timeout=10,
+            )
+
+        events = _parse_ndjson(resp.text)
+        confirm_event = next(e for e in events if e["type"] == "confirm")
+        assert confirm_event["auto_approved"] is True
+        assert any(e["type"] == "change_applied" for e in events)
         assert (ws / "target.py").read_text() == "value = 2\n"
 
     def test_confirm_with_no_pending_approval_rejected(self, server, workspace):

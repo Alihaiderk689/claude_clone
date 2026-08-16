@@ -41,6 +41,27 @@ body {
   background: var(--vscode-button-secondaryHoverBackground);
 }
 
+.mode-toggle {
+  display: flex;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.mode-btn {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: none;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+.mode-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.mode-btn.active {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+.mode-btn.active:hover { background: var(--vscode-button-hoverBackground); }
+
 #task-progress {
   padding: 6px 10px;
   font-size: 0.9em;

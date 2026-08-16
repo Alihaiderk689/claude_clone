@@ -42,10 +42,11 @@ from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
+from . import context_budget
 from .cli import _fresh_session_state
 from .loop import run_agent_turn
 from .logging_config import get_logger
-from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient
+from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient, timeout_from_env
 from .project import ProjectRoot
 from .tools.state import FileStateTracker
 from .task_state import TaskState
@@ -61,6 +62,8 @@ TOKEN_DIR = Path.home() / ".code-agent"
 TOKEN_FILE = TOKEN_DIR / "server.json"
 
 CONFIRM_EVENT_TYPES = {"confirm", "confirm_command", "confirm_git_operation", "confirm_plan"}
+
+VALID_MODES = {"manual", "auto"}
 
 # How long a /chat handler thread waits on the confirm queue before checking
 # cancel_event again -- keeps Stop Task responsive even while paused on an
@@ -88,6 +91,12 @@ class Session:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     confirm_queue: "queue.Queue" = field(default_factory=queue.Queue)
     awaiting_confirm: bool = False
+    # "manual" (default) or "auto" -- see loop.py's auto_approve_edits.
+    # Deliberately NOT touched by SessionStore.reset() below, so it
+    # survives /task/new as a UI preference rather than task data, but
+    # every session still starts "manual" the first time it's created
+    # (safety-by-default on every fresh `code-agent serve` start).
+    mode: str = "manual"
 
 
 class SessionStore:
@@ -217,6 +226,7 @@ def _task_status_payload(session: Session) -> dict:
         "errors_encountered": list(ts.errors_encountered),
         "git_operations": list(ts.git_operations),
         "turn_in_progress": session.lock.locked(),
+        "mode": session.mode,
     }
 
 
@@ -347,6 +357,9 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/task/new":
             self._handle_task_new(body)
             return
+        if parsed.path == "/task/mode":
+            self._handle_task_mode(body)
+            return
         self._send_json(404, {"error": "Not found."})
 
     # -- endpoint implementations ------------------------------------------
@@ -404,6 +417,8 @@ class _Handler(BaseHTTPRequestHandler):
                 tracker=session.tracker,
                 task_state=session.task_state,
                 cancel_event=session.cancel_event,
+                auto_approve_edits=(session.mode == "auto"),
+                max_context_chars=self.max_context_chars,
             )
 
             send_value = None
@@ -419,9 +434,15 @@ class _Handler(BaseHTTPRequestHandler):
                     self._write_chunk_line(_to_jsonable(event))
 
                     if event["type"] in CONFIRM_EVENT_TYPES:
-                        session.awaiting_confirm = True
-                        send_value = self._wait_for_confirm(session)
-                        session.awaiting_confirm = False
+                        if event.get("auto_approved"):
+                            # run_agent_turn already resolved this
+                            # internally (Auto mode, edits/plans only) --
+                            # no need to wait on the confirm queue.
+                            send_value = None
+                        else:
+                            session.awaiting_confirm = True
+                            send_value = self._wait_for_confirm(session)
+                            session.awaiting_confirm = False
             except (BrokenPipeError, ConnectionResetError):
                 _logger.warning("[%s] chat connection lost mid-stream; rolling back this turn.", request_id)
                 del session.messages[history_len_before:]
@@ -508,6 +529,24 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._send_json(200, {"ok": True})
 
+    def _handle_task_mode(self, body: dict) -> None:
+        """Sets Manual/Auto mode for a workspace's session -- see
+        Session.mode's docstring and loop.py's auto_approve_edits for what
+        this actually changes (edits/plans only; commands and every Git
+        operation always require individual approval no matter what this
+        is set to).
+        """
+        workspace_root = body.get("workspace_root")
+        session = self._session_or_400(workspace_root)
+        if session is None:
+            return
+        mode = body.get("mode")
+        if mode not in VALID_MODES:
+            self._send_json(400, {"error": f"mode must be one of {sorted(VALID_MODES)}."})
+            return
+        session.mode = mode
+        self._send_json(200, {"ok": True, "mode": session.mode})
+
 
 def build_server(port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     """Construct and bind the server (auth token generated, token file
@@ -519,7 +558,7 @@ def build_server(port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     """
     host = os.environ.get("OLLAMA_HOST", DEFAULT_HOST)
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
-    client = OllamaClient(host=host, model=model)
+    client = OllamaClient(host=host, model=model, timeout=timeout_from_env())
 
     token = secrets.token_hex(32)
 
@@ -528,6 +567,7 @@ def build_server(port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     _Handler.ollama_host = host
     _Handler.token = token
     _Handler.sessions = SessionStore()
+    _Handler.max_context_chars = context_budget.max_context_chars_from_env()
 
     httpd = _bind_socket(port)
     bound_host, bound_port = httpd.server_address[:2]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .command_policy import ApprovedCommand
@@ -45,6 +46,20 @@ _STALE_PLACEHOLDER = (
 _TRIMMED_PLACEHOLDER = "[tool output omitted to save context -- see the task memory summary above]"
 
 _TEST_SUMMARY_RE = re.compile(r"(\d+\s+(?:passed|failed|error|errors|skipped)[\w\s,]*)", re.IGNORECASE)
+
+
+@dataclass
+class CompactionStats:
+    """What compact_messages actually did on one call -- purely for debug
+    logging/benchmarking (Phase 9); callers that ignore the return value are
+    unaffected, same as before it existed."""
+
+    superseded: int = 0
+    stale: int = 0
+    trimmed: int = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.superseded or self.stale or self.trimmed)
 
 
 # --------------------------------------------------------------------------
@@ -174,10 +189,12 @@ def _iter_tool_messages_with_args(
             yield i, name, args, msg
 
 
-def _replace_if_not_already_placeholder(msg: dict, placeholder: str) -> None:
+def _replace_if_not_already_placeholder(msg: dict, placeholder: str) -> bool:
     content = msg.get("content") or ""
     if content and not content.startswith("["):
         msg["content"] = placeholder
+        return True
+    return False
 
 
 def compact_messages(
@@ -185,7 +202,7 @@ def compact_messages(
     task_state: Optional[TaskState] = None,
     max_context_chars: int = MAX_CONTEXT_CHARS,
     keep_recent: int = KEEP_RECENT_TOOL_MESSAGES,
-) -> None:
+) -> CompactionStats:
     """Mutates `messages` in place. Two passes:
 
     1. Per-path read_file bookkeeping: an older read_file result for a path
@@ -196,6 +213,11 @@ def compact_messages(
        disk. (edit_file's own stale-edit check in tools/editing.py is the
        real safety backstop for actually writing a file; this pass is about
        what the model *sees* in conversation history, not file-write safety.)
+       A "newer" read_file result that's itself a Phase 9 cache-hit stub
+       (`msg["cache_hit"]` set by loop.py -- see tools/filesystem.py's
+       unchanged-file short-circuit) never supersedes anything: it carries
+       no real content of its own, so the *older* real read is still the
+       only actual copy of the file in context and must survive untouched.
 
     2. Only if the context is still large after that: trim the oldest tool
        output down to short placeholders, working from the earliest tool
@@ -203,23 +225,31 @@ def compact_messages(
        recent `keep_recent` tool messages.
 
     Never touches non-tool messages (user/assistant/system content).
+
+    Returns a CompactionStats describing what happened, for debug
+    logging/benchmarking -- callers that ignore it are unaffected.
     """
+    stats = CompactionStats()
     last_read_index: Dict[str, int] = {}
     for i, name, args, msg in _iter_tool_messages_with_args(messages):
         path = args.get("path")
         if not path:
             continue
         if name == "read_file":
-            if path in last_read_index:
-                _replace_if_not_already_placeholder(
+            is_cache_hit_stub = bool(msg.get("cache_hit"))
+            if path in last_read_index and not is_cache_hit_stub:
+                if _replace_if_not_already_placeholder(
                     messages[last_read_index[path]], _SUPERSEDED_PLACEHOLDER.format(path=path)
-                )
-            last_read_index[path] = i
+                ):
+                    stats.superseded += 1
+            if not is_cache_hit_stub:
+                last_read_index[path] = i
         elif name in ("edit_file", "write_file"):
             if path in last_read_index:
-                _replace_if_not_already_placeholder(
+                if _replace_if_not_already_placeholder(
                     messages[last_read_index[path]], _STALE_PLACEHOLDER.format(path=path)
-                )
+                ):
+                    stats.stale += 1
                 del last_read_index[path]
 
     tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
@@ -236,3 +266,6 @@ def compact_messages(
         content = messages[i].get("content") or ""
         if len(content) > len(_TRIMMED_PLACEHOLDER) and not content.startswith("["):
             messages[i]["content"] = _TRIMMED_PLACEHOLDER
+            stats.trimmed += 1
+
+    return stats

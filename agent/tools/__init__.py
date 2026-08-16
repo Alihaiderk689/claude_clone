@@ -40,7 +40,10 @@ def build_default_registry(
     `task_state` backs the planning tools (update_plan/get_plan read and
     write the plan living on it; create_plan only proposes one, adopted by
     loop.py after approval) and is shared with agent/context_manager.py, so
-    pass the same instance to run_agent_turn as well.
+    pass the same instance to run_agent_turn as well. read_file also reads
+    (never writes) task_state.files_inspected, as the second, narrow
+    exception to "tools don't know about TaskState" -- see the Phase 9
+    unchanged-file short-circuit in tools/filesystem.py._read_file.
 
     Git tools are always registered, even outside a Git repository -- each
     one reports "This project is not a Git repository" gracefully rather
@@ -50,7 +53,7 @@ def build_default_registry(
     task_state = task_state if task_state is not None else TaskState()
     registry = ToolRegistry()
     registry.register(build_list_files_tool(project))
-    registry.register(build_read_file_tool(project, tracker))
+    registry.register(build_read_file_tool(project, tracker, task_state))
     registry.register(build_search_files_tool(project))
     registry.register(build_edit_file_tool(project, tracker))
     registry.register(build_write_file_tool(project, tracker))

@@ -43,6 +43,10 @@ from .base import ExternalToolUnavailableError, Tool, ToolError, ToolResult, Too
 MAX_LOG_ENTRIES = 20
 MAX_DIFF_CHARS = 8000
 GIT_SUBPROCESS_TIMEOUT = 15
+# Phase 9: git_status was the one tool output with no cap at all -- a huge
+# uncommitted change (thousands of untracked files) would otherwise list
+# every single path with no ceiling, unlike every other inspection tool.
+MAX_STATUS_ENTRIES_PER_CATEGORY = 100
 
 # Same rationale as terminal.py's _minimal_env: never hand a subprocess the
 # full parent environment, since incidental output (or a hook script) could
@@ -220,7 +224,12 @@ def _git_status(project: ProjectRoot, _args: GitStatusArgs) -> ToolResult:
         ):
             if items:
                 lines.append(f"\n{label}:")
-                lines.extend(f"  {p}" for p in items)
+                lines.extend(f"  {p}" for p in items[:MAX_STATUS_ENTRIES_PER_CATEGORY])
+                if len(items) > MAX_STATUS_ENTRIES_PER_CATEGORY:
+                    lines.append(
+                        f"  ... truncated at {MAX_STATUS_ENTRIES_PER_CATEGORY} entries "
+                        f"({len(items) - MAX_STATUS_ENTRIES_PER_CATEGORY} more not shown)."
+                    )
 
     return ToolResult(ok=True, output="\n".join(lines), display="git_status()")
 

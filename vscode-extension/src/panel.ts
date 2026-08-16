@@ -6,7 +6,7 @@
  * user clicks back to it -- see agent/server.py for the actual state.
  */
 import * as vscode from "vscode";
-import { AgentClient, AgentEvent } from "./client";
+import { AgentClient, AgentEvent, AgentMode } from "./client";
 import { DiffContentProvider } from "./diffProvider";
 import { resolveWithinWorkspace } from "./pathSafety";
 
@@ -193,6 +193,14 @@ export class ChatPanel {
           this.post({ type: "error", message: describeError(err) });
         }
         return;
+      case "setMode":
+        try {
+          await this.client.setMode(this.workspaceRoot, msg.mode as AgentMode);
+          await this.refreshTaskStatus();
+        } catch (err) {
+          this.post({ type: "error", message: describeError(err) });
+        }
+        return;
       case "openFile":
         await openFileAtLine(this.workspaceRoot, msg.path as string, msg.line as number | undefined);
         return;
@@ -266,6 +274,10 @@ export class ChatPanel {
     <span id="status-indicator" class="offline">&#9675; Offline</span>
     <span id="model-name"></span>
     <span class="spacer"></span>
+    <span class="mode-toggle" role="group" aria-label="Approval mode">
+      <button id="mode-manual-btn" class="mode-btn active" title="Ask before every edit">Manual</button>
+      <button id="mode-auto-btn" class="mode-btn" title="Auto-approve edits and plans -- commands and Git operations still ask every time">Auto</button>
+    </span>
     <button id="stop-task-btn" title="Stop the current task">Stop Task</button>
     <button id="new-task-btn" title="Start a new task">New Task</button>
   </div>

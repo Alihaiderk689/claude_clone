@@ -156,6 +156,10 @@ def _tool_result(name: str, content: str) -> dict:
     return {"role": "tool", "tool_name": name, "content": content}
 
 
+def _cache_hit_tool_result(name: str, content: str) -> dict:
+    return {"role": "tool", "tool_name": name, "content": content, "cache_hit": True}
+
+
 class TestCompactMessagesDedup:
     def test_older_duplicate_read_is_superseded(self):
         messages = [
@@ -233,6 +237,88 @@ class TestCompactMessagesInvalidation:
         ]
         context_manager.compact_messages(messages)
         assert messages[4]["content"] == "backend/auth.py (10 lines)\nfresh content after edit"
+
+
+class TestCompactMessagesCacheHitAware:
+    """Phase 9: a read_file result marked cache_hit (the unchanged-file
+    short-circuit in tools/filesystem.py) carries no real content of its
+    own, so it must never supersede -- and must never itself become -- the
+    real copy of a file's content in the conversation."""
+
+    def test_cache_hit_stub_does_not_supersede_the_real_read(self):
+        messages = [
+            {"role": "system", "content": "Base."},
+            _assistant_call("read_file", {"path": "backend/auth.py"}),
+            _tool_result("read_file", "backend/auth.py (10 lines)\n... real content ..."),
+            {"role": "user", "content": "read it again"},
+            _assistant_call("read_file", {"path": "backend/auth.py"}),
+            _cache_hit_tool_result("read_file", "'backend/auth.py' is unchanged since you last read it."),
+        ]
+        context_manager.compact_messages(messages)
+
+        # The ONLY real copy of the content must survive untouched.
+        assert messages[2]["content"] == "backend/auth.py (10 lines)\n... real content ..."
+        assert not messages[2]["content"].startswith("[")
+
+    def test_a_later_real_read_still_supersedes_the_original_after_a_cache_hit(self):
+        messages = [
+            {"role": "system", "content": "Base."},
+            _assistant_call("read_file", {"path": "a.py"}),
+            _tool_result("read_file", "first real read"),
+            _assistant_call("read_file", {"path": "a.py"}),
+            _cache_hit_tool_result("read_file", "unchanged"),
+            _assistant_call("read_file", {"path": "a.py"}),
+            _tool_result("read_file", "second real read (forced)"),
+        ]
+        context_manager.compact_messages(messages)
+
+        assert messages[2]["content"].startswith("[earlier read_file result")
+        assert messages[6]["content"] == "second real read (forced)"
+
+
+class TestCompactMessagesStats:
+    def test_reports_superseded_count(self):
+        messages = [
+            {"role": "system", "content": "Base."},
+            _assistant_call("read_file", {"path": "a.py"}),
+            _tool_result("read_file", "first"),
+            _assistant_call("read_file", {"path": "a.py"}),
+            _tool_result("read_file", "second"),
+        ]
+        stats = context_manager.compact_messages(messages)
+        assert stats.superseded == 1
+        assert stats.stale == 0
+
+    def test_reports_stale_count(self):
+        messages = [
+            {"role": "system", "content": "Base."},
+            _assistant_call("read_file", {"path": "a.py"}),
+            _tool_result("read_file", "original"),
+            _assistant_call("edit_file", {"path": "a.py", "old_text": "x", "new_text": "y"}),
+            _tool_result("edit_file", "Updated 'a.py' successfully."),
+        ]
+        stats = context_manager.compact_messages(messages)
+        assert stats.stale == 1
+
+    def test_reports_trimmed_count(self):
+        messages = [{"role": "system", "content": "Base."}]
+        for i in range(10):
+            messages.append(_assistant_call("list_files", {"path": f"dir{i}"}))
+            messages.append(_tool_result("list_files", "x" * 2000))
+        stats = context_manager.compact_messages(messages, max_context_chars=5000, keep_recent=2)
+        assert stats.trimmed > 0
+
+    def test_empty_stats_for_a_small_untouched_conversation(self):
+        messages = [
+            {"role": "system", "content": "Base."},
+            _assistant_call("list_files", {"path": "."}),
+            _tool_result("list_files", "a.py\nb.py"),
+        ]
+        stats = context_manager.compact_messages(messages)
+        assert stats.superseded == 0
+        assert stats.stale == 0
+        assert stats.trimmed == 0
+        assert bool(stats) is False
 
 
 class TestCompactMessagesSizeFallback:

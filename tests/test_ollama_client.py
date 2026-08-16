@@ -13,12 +13,14 @@ import pytest
 import requests
 
 from agent.ollama_client import (
+    DEFAULT_TIMEOUT,
     OllamaAPIError,
     OllamaCancelledError,
     OllamaClient,
     OllamaConnectionError,
     OllamaModelNotFoundError,
     OllamaTimeoutError,
+    timeout_from_env,
 )
 
 
@@ -30,6 +32,30 @@ def make_stream_response(lines, status_code=200):
         line.encode("utf-8") if isinstance(line, str) else line for line in lines
     ]
     return response
+
+
+class TestTimeoutFromEnv:
+    def test_returns_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
+        assert timeout_from_env() == DEFAULT_TIMEOUT
+
+    def test_returns_default_for_empty_string(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "")
+        assert timeout_from_env() == DEFAULT_TIMEOUT
+
+    def test_parses_a_valid_value(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "300")
+        assert timeout_from_env() == 300.0
+
+    def test_returns_default_for_non_numeric_value(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "not-a-number")
+        assert timeout_from_env() == DEFAULT_TIMEOUT
+
+    def test_returns_default_for_zero_or_negative_value(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "0")
+        assert timeout_from_env() == DEFAULT_TIMEOUT
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "-5")
+        assert timeout_from_env() == DEFAULT_TIMEOUT
 
 
 class TestCheckConnection:

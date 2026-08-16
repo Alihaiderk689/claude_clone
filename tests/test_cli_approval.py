@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 from agent.cli import (
+    AUTO_MODE_COMMANDS,
+    MANUAL_MODE_COMMANDS,
     _ask_approval,
     _ask_command_approval,
     _ask_git_approval,
@@ -19,11 +21,13 @@ from agent.cli import (
     _handle_confirm,
     _handle_git_confirm,
     _handle_plan_confirm,
+    render_turn,
 )
 from agent.command_policy import ApprovedCommand
 from agent.diff import ProposedChange
 from agent.git_policy import ProposedGitOperation
 from agent.planner import Plan, PlanStep
+from agent.task_state import TaskState
 
 
 def make_console(input_value: str):
@@ -326,3 +330,107 @@ class TestHandlePlanConfirm:
         assert "Inspect auth" in printed
         assert "Add endpoint" in printed
         assert "Proceed?" in printed
+
+
+class TestModeCommandConstants:
+    def test_auto_and_manual_are_distinct_single_commands(self):
+        assert AUTO_MODE_COMMANDS == {"/auto"}
+        assert MANUAL_MODE_COMMANDS == {"/manual"}
+        assert AUTO_MODE_COMMANDS.isdisjoint(MANUAL_MODE_COMMANDS)
+
+
+def _make_render_turn_console(input_value: str):
+    """Like make_console(), but a MagicMock so `console.status(...)` works
+    as the context manager render_turn() uses it as -- only render_turn()
+    itself needs that, none of the individual _handle_* helpers do."""
+    console = mock.MagicMock()
+    console.input.return_value = input_value
+    console.width = 80
+    return console
+
+
+class TestRenderTurnAutoApproved:
+    """render_turn() itself (not just the individual _handle_* helpers)
+    must skip prompting when an event already carries `auto_approved` --
+    this is the CLI half of Auto mode, driven by /auto and /manual in
+    main()'s input loop."""
+
+    def _change(self):
+        return ProposedChange(
+            path="x.py",
+            resolved_path=Path("/tmp/x.py"),
+            kind="edit",
+            old_content="old\n",
+            new_content="new\n",
+        )
+
+    def _plan(self):
+        return Plan(goal="Add JWT authentication", steps=[PlanStep(id=1, description="Inspect auth")])
+
+    def test_auto_approved_edit_is_not_prompted(self):
+        console = _make_render_turn_console("this should never be read")
+        events = iter(
+            [
+                {"type": "confirm", "name": "edit_file", "change": self._change(), "auto_approved": True},
+                {"type": "change_applied", "name": "edit_file", "path": "x.py"},
+                {"type": "final", "text": "Done."},
+            ]
+        )
+
+        def fake_gen(*_args, **_kwargs):
+            for event in events:
+                yield event
+
+        with mock.patch("agent.cli.run_agent_turn", side_effect=fake_gen):
+            render_turn(
+                console, mock.Mock(), mock.Mock(), [], mock.Mock(), TaskState(), auto_approve_edits=True
+            )
+
+        console.input.assert_not_called()
+        printed = _all_console_output(console)
+        assert "Auto-approved" in printed
+        assert "x.py" in printed
+
+    def test_auto_approved_plan_is_not_prompted(self):
+        console = _make_render_turn_console("this should never be read")
+        events = iter(
+            [
+                {"type": "confirm_plan", "name": "create_plan", "plan": self._plan(), "auto_approved": True},
+                {"type": "plan_approved", "name": "create_plan", "plan": self._plan()},
+                {"type": "final", "text": "Done."},
+            ]
+        )
+
+        def fake_gen(*_args, **_kwargs):
+            for event in events:
+                yield event
+
+        with mock.patch("agent.cli.run_agent_turn", side_effect=fake_gen):
+            render_turn(
+                console, mock.Mock(), mock.Mock(), [], mock.Mock(), TaskState(), auto_approve_edits=True
+            )
+
+        console.input.assert_not_called()
+        assert "Auto-approved" in _all_console_output(console)
+
+    def test_manual_mode_confirm_still_prompts_normally(self):
+        """Sanity check: the default (auto_approve_edits=False, matching
+        every pre-existing call site) must be completely unaffected."""
+        console = _make_render_turn_console("y")
+        events = iter(
+            [
+                {"type": "confirm", "name": "edit_file", "change": self._change()},
+                {"type": "change_applied", "name": "edit_file", "path": "x.py"},
+                {"type": "final", "text": "Done."},
+            ]
+        )
+
+        def fake_gen(*_args, **_kwargs):
+            for event in events:
+                yield event
+
+        with mock.patch("agent.cli.run_agent_turn", side_effect=fake_gen):
+            render_turn(console, mock.Mock(), mock.Mock(), [], mock.Mock(), TaskState())
+
+        console.input.assert_called()
+        assert "Auto-approved" not in _all_console_output(console)

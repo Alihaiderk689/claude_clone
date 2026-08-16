@@ -16,13 +16,13 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
-from . import context_manager
+from . import context_budget, context_manager
 from .command_policy import ApprovedCommand
 from .diff import ProposedChange, unified_diff_text
 from .git_policy import ProposedGitOperation
 from .logging_config import configure_logging, debug_enabled_from_env, get_logger
 from .loop import MAX_TOOL_ITERATIONS, run_agent_turn
-from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient
+from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient, timeout_from_env
 from .planner import Plan
 from .project import ProjectRoot
 from .task_state import TaskState
@@ -40,6 +40,15 @@ Use inspection tools only for questions that actually require looking at this pr
 structure, or Git history — never guess about file names, code, or behavior you have not actually \
 inspected.
 
+Pick the narrowest tool for what you actually need: need to find a file or a symbol without \
+knowing exactly where it is → search_files; need a directory's structure → list_files; need a \
+specific file's contents once you know its path → read_file; need to modify an existing file → \
+edit_file; need to create a new file → write_file; need to run a test/lint/build command → \
+run_command; need Git state → git_status/git_diff/git_log. Don't read_file every file in a \
+directory to find something — search_files first, then read only what's actually relevant. \
+Don't re-read a file you already have unchanged content for in this conversation (read_file will \
+tell you when that's happened).
+
 For general programming questions that have nothing to do with this specific project (language \
 features, concepts, debugging advice, writing a standalone example, etc.), answer directly from \
 your own knowledge — do not call a tool and do not claim you're unable to help just because a \
@@ -53,6 +62,14 @@ actually read in this conversation.
 4. Use edit_file for existing files (old_text must match the file's real content exactly once —
 include enough surrounding context to make the match unambiguous). Use write_file only for files \
 that don't exist yet; it fails if the file is already there.
+
+When you decide to make a change, call edit_file or write_file immediately — never describe the \
+change, paste the new file content, or show a diff as plain chat text and then ask whether to \
+proceed. Printing code or a diff in your reply does nothing: only an actual edit_file/write_file \
+tool call proposes something the user can approve. This applies just as much once the user has \
+already told you to go ahead — if they reply "yes", "proceed", "go ahead", or similar after you \
+described a plan, your very next output must be the tool call itself, not another description of \
+what you're about to do.
 
 Every edit_file and write_file call only proposes a change — it is never applied automatically. \
 The user is shown a diff and must explicitly approve it before anything is written to disk. \
@@ -104,7 +121,10 @@ anything else instead of assuming they're safe to override.
 Neither editing, running commands, nor Git modifications (including pushing) happen automatically \
 — in every case, never claim an action completed until the tool result confirms the user approved \
 it and it succeeded. A pending or rejected proposal is not a completed action. Only mention a \
-limitation if the user actually asks for something it covers; do not bring it up otherwise.
+limitation if the user actually asks for something it covers; do not bring it up otherwise. The \
+same rule as for editing applies here too: once you know which command to run or which Git \
+operation to propose, call run_command/git_stage/git_commit/git_push etc. directly — do not type \
+out the command or describe the Git operation in prose and ask if you should run it.
 
 For multi-step tasks that genuinely span several files or concerns (e.g. "add JWT authentication", \
 "add password reset functionality"), call create_plan first with a short goal and a handful of \
@@ -329,7 +349,16 @@ def _handle_plan_confirm(console: Console, plan: Plan) -> bool:
     return _ask_plan_approval(console)
 
 
-def render_turn(console: Console, client: OllamaClient, registry, messages: list, tracker, task_state) -> None:
+def render_turn(
+    console: Console,
+    client: OllamaClient,
+    registry,
+    messages: list,
+    tracker,
+    task_state,
+    auto_approve_edits: bool = False,
+    max_context_chars: int = context_manager.MAX_CONTEXT_CHARS,
+) -> None:
     """Consume one agent turn's events and render them to the terminal.
 
     Each model round-trip is fully buffered before it's shown (see loop.py
@@ -338,13 +367,26 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
     restarted. Proposed file changes pause the underlying generator via
     generator.send() until the user answers — see run_agent_turn's "confirm"
     event.
+
+    If `auto_approve_edits` is set (Auto mode, toggled with /auto and
+    /manual), edit and plan approvals arrive already resolved (see
+    run_agent_turn's `auto_approved` event field) — no prompt is shown for
+    them, just a status line. Commands and Git operations are never
+    affected by this and still prompt exactly as in Manual mode.
     """
     inspecting_announced = False
     prefix_printed = False
     turn_state = {"approve_all": False}
 
     gen = run_agent_turn(
-        client, registry, messages, tracker=tracker, task_state=task_state, max_iterations=MAX_TOOL_ITERATIONS
+        client,
+        registry,
+        messages,
+        tracker=tracker,
+        task_state=task_state,
+        max_iterations=MAX_TOOL_ITERATIONS,
+        auto_approve_edits=auto_approve_edits,
+        max_context_chars=max_context_chars,
     )
 
     with console.status("[dim]Agent is thinking...[/dim]", spinner="dots") as status:
@@ -382,8 +424,11 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
                 if not inspecting_announced:
                     console.print("[dim]Agent is inspecting the project...[/dim]\n")
                     inspecting_announced = True
-                console.print("\n[bold]Proposed change:[/bold]")
-                send_value = _handle_confirm(console, event["change"], turn_state)
+                if event.get("auto_approved"):
+                    console.print(f"[dim]✓ Auto-approved edit: {escape(event['change'].path)}[/dim]")
+                else:
+                    console.print("\n[bold]Proposed change:[/bold]")
+                    send_value = _handle_confirm(console, event["change"], turn_state)
                 status.start()
 
             elif etype == "change_applied":
@@ -428,7 +473,10 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
                 if not inspecting_announced:
                     console.print("[dim]Agent is inspecting the project...[/dim]\n")
                     inspecting_announced = True
-                send_value = _handle_plan_confirm(console, event["plan"])
+                if event.get("auto_approved"):
+                    console.print(f"[dim]✓ Auto-approved plan: {escape(event['plan'].goal)}[/dim]")
+                else:
+                    send_value = _handle_plan_confirm(console, event["plan"])
                 status.start()
 
             elif etype == "plan_approved":
@@ -478,6 +526,8 @@ def render_turn(console: Console, client: OllamaClient, registry, messages: list
 
 
 NEW_TASK_COMMANDS = {"/new"}
+AUTO_MODE_COMMANDS = {"/auto"}
+MANUAL_MODE_COMMANDS = {"/manual"}
 
 
 def _fresh_session_state(project: ProjectRoot, project_root_path: Path):
@@ -539,9 +589,11 @@ def main() -> None:
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
     project_root_path = Path.cwd().resolve()
 
-    client = OllamaClient(host=host, model=model)
+    client = OllamaClient(host=host, model=model, timeout=timeout_from_env())
     project = ProjectRoot(project_root_path)
     tracker, task_state, registry, messages = _fresh_session_state(project, project_root_path)
+    mode = "manual"  # toggled with /auto and /manual; survives /new, resets on process restart
+    max_context_chars = context_budget.max_context_chars_from_env()
 
     console.print(build_banner(model, project_root_path))
     console.print()
@@ -575,11 +627,33 @@ def main() -> None:
             console.print("[dim]Started a new task. Project files and Git history are untouched.[/dim]\n")
             continue
 
+        if user_input.lower() in AUTO_MODE_COMMANDS:
+            mode = "auto"
+            console.print(
+                "[dim]Auto mode on: file edits and plans apply without asking. Commands and Git "
+                "operations still ask every time. Switch back with /manual.[/dim]\n"
+            )
+            continue
+
+        if user_input.lower() in MANUAL_MODE_COMMANDS:
+            mode = "manual"
+            console.print("[dim]Manual mode on: every edit, command, and Git operation asks again.[/dim]\n")
+            continue
+
         history_len_before = len(messages)
         messages.append({"role": "user", "content": user_input})
 
         try:
-            render_turn(console, client, registry, messages, tracker, task_state)
+            render_turn(
+                console,
+                client,
+                registry,
+                messages,
+                tracker,
+                task_state,
+                auto_approve_edits=(mode == "auto"),
+                max_context_chars=max_context_chars,
+            )
         except KeyboardInterrupt:
             console.print("\n[dim](response interrupted)[/dim]")
             del messages[history_len_before:]

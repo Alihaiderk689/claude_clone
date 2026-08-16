@@ -6,12 +6,14 @@ import os
 import pytest
 
 from agent.project import MAX_FILE_SIZE_BYTES, ProjectRoot
+from agent.task_state import TaskState
 from agent.tools.filesystem import (
     ListFilesArgs,
     ReadFileArgs,
     build_list_files_tool,
     build_read_file_tool,
 )
+from agent.tools.state import FileStateTracker
 
 requires_non_root = pytest.mark.skipif(
     hasattr(os, "getuid") and os.getuid() == 0,
@@ -191,6 +193,108 @@ class TestReadFile:
         assert result.error_type == "PermissionError"
         assert result.recoverable is False
         assert "permission" in result.output.lower()
+
+
+class TestReadFileCache:
+    """Phase 9 unchanged-file short-circuit: a second full read of a path
+    already in task_state.files_inspected, whose disk content still matches
+    the tracker's recorded hash, returns a short cache-hit notice instead of
+    resending the whole file -- see tools/filesystem.py's _read_file."""
+
+    @pytest.fixture
+    def tracker(self):
+        return FileStateTracker()
+
+    @pytest.fixture
+    def task_state(self):
+        return TaskState()
+
+    @pytest.fixture
+    def cached_read_tool(self, project, tracker, task_state):
+        return build_read_file_tool(project, tracker, task_state)
+
+    def test_second_read_of_unchanged_file_is_a_cache_hit(self, cached_read_tool, task_state):
+        first = cached_read_tool.execute({"path": "README.md"})
+        assert first.ok
+        assert first.cache_hit is None
+        task_state.note_file_inspected("README.md")
+
+        second = cached_read_tool.execute({"path": "README.md"})
+        assert second.ok
+        assert second.cache_hit is True
+        assert "unchanged since you last read it" in second.output
+        assert "Sample project" not in second.output  # full content NOT resent
+
+    def test_first_read_is_never_a_cache_hit(self, cached_read_tool):
+        result = cached_read_tool.execute({"path": "README.md"})
+        assert result.ok
+        assert result.cache_hit is None
+
+    def test_force_bypasses_the_cache(self, cached_read_tool, task_state):
+        cached_read_tool.execute({"path": "README.md"})
+        task_state.note_file_inspected("README.md")
+
+        result = cached_read_tool.execute({"path": "README.md", "force": True})
+        assert result.ok
+        assert result.cache_hit is None
+        assert "Sample project" in result.output
+
+    def test_ranged_read_never_short_circuits(self, cached_read_tool, task_state):
+        cached_read_tool.execute({"path": "backend/accounts/views.py"})
+        task_state.note_file_inspected("backend/accounts/views.py")
+
+        result = cached_read_tool.execute(
+            {"path": "backend/accounts/views.py", "start_line": 1, "end_line": 2}
+        )
+        assert result.ok
+        assert result.cache_hit is None
+        assert "line 1" in result.output
+
+    def test_cache_miss_after_edit_invalidates_inspected(self, project, tracker, task_state, cached_read_tool):
+        cached_read_tool.execute({"path": "README.md"})
+        task_state.note_file_inspected("README.md")
+        # Simulate what apply_change() does: re-record the new hash and drop
+        # the path from files_inspected (the existing cache-invalidation
+        # contract in TaskState.note_file_modified).
+        target = project.resolve("README.md")
+        target.write_text("# Changed\n")
+        tracker.record(target, "# Changed\n")
+        task_state.note_file_modified("README.md")
+
+        result = cached_read_tool.execute({"path": "README.md"})
+        assert result.ok
+        assert result.cache_hit is None
+        assert "# Changed" in result.output
+
+    def test_cache_miss_after_external_disk_modification(self, project, tracker, task_state, cached_read_tool):
+        cached_read_tool.execute({"path": "README.md"})
+        task_state.note_file_inspected("README.md")
+        # Modified on disk WITHOUT going through edit_file/write_file (e.g. a
+        # user editing it directly) -- files_inspected still claims it's
+        # inspected, but the tracker's hash comparison must still catch the
+        # drift and refuse the short-circuit.
+        target = project.resolve("README.md")
+        target.write_text("# Externally changed\n")
+
+        result = cached_read_tool.execute({"path": "README.md"})
+        assert result.ok
+        assert result.cache_hit is None
+        assert "# Externally changed" in result.output
+
+    def test_no_task_state_never_short_circuits(self, project, tracker):
+        tool = build_read_file_tool(project, tracker, task_state=None)
+        tool.execute({"path": "README.md"})
+        result = tool.execute({"path": "README.md"})
+        assert result.ok
+        assert result.cache_hit is None
+
+    def test_no_tracker_never_short_circuits(self, project, task_state):
+        tool = build_read_file_tool(project, tracker=None, task_state=task_state)
+        tool.execute({"path": "README.md"})
+        task_state.note_file_inspected("README.md")
+        result = tool.execute({"path": "README.md"})
+        assert result.ok
+        assert result.cache_hit is None
 
 
 class TestListFilesPermissionError:

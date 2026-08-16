@@ -18,8 +18,13 @@ layer (tool, Ollama, subprocess, HTTP) are classified and recovered from instead
 to crash the agent or corrupt its state — see "Reliability and failure recovery (Phase 8)" below.
 `git_push` (added after Phase 8, by explicit request) is the one deliberate exception to "no
 remote operations" — see "Git push: narrow by design, not by accident" below for why it doesn't
-weaken the no-generic-git-command guarantee. See README.md for the full user-facing walkthrough,
-tool list, and phase-by-phase feature history.
+weaken the no-generic-git-command guarantee. Both the CLI and the VS Code extension also support a
+Manual/Auto approval-mode toggle (added by explicit request, see "Manual/Auto approval mode"
+below) — Auto only ever auto-approves file edits and plan approvals, never commands or Git. Phase 9
+closed real (verified, not assumed) context/performance gaps on top of Phases 1–8's already
+substantial context management — see "Phase 9: context, performance & Qwen 3B optimization" below
+for exactly what was already there versus what's genuinely new. See README.md for the full
+user-facing walkthrough, tool list, and phase-by-phase feature history.
 
 ## Commands
 
@@ -60,10 +65,13 @@ code-agent serve --debug          # or: CODE_AGENT_DEBUG=1 code-agent serve
 
 # Qwen 3B benchmark (real Ollama required; not part of the pytest suite)
 python -m agent.benchmark --output benchmark_report.json
+python -m agent.benchmark --compare before.json after.json  # diff two saved reports, no Ollama needed
 ```
 
-`OLLAMA_HOST` (default `http://localhost:11434`) and `OLLAMA_MODEL` (default `qwen2.5-coder:3b`)
-are the only configuration, set as environment variables. `code-agent serve` reads the same two.
+`OLLAMA_HOST` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen2.5-coder:3b`), and
+`OLLAMA_TIMEOUT` (default `120` seconds, parsed by `ollama_client.py`'s `timeout_from_env()` --
+falls back to the default rather than raising on a missing/non-numeric/non-positive value) are the
+only configuration, set as environment variables. `code-agent serve` reads the same three.
 
 ## Architecture
 
@@ -133,6 +141,47 @@ force-push capability would fail CI, not just review. If you're tempted to add a
 or a `refspec`/`branch` override to `GitPushArgs` — don't; that's exactly the shape of change that
 would turn this from "narrow tool" back into "generic executor," which is the one thing this
 codebase has held the line on since Phase 5.
+
+### Manual/Auto approval mode: scoped to edits and plans, never commands or Git
+
+Both the CLI (`/auto`, `/manual`) and the VS Code extension (the Manual/Auto toggle in the status
+bar) offer a persistent mode that changes how `confirm`/`confirm_plan` events are resolved — nothing
+else. **Auto mode auto-approves file edits and plan approvals only. `run_command` and every Git
+operation (including `git_push`) always require individual approval, regardless of mode, with no
+way to disable that.** This mirrors the pre-existing `approve_all`/`a` "approve all" mechanism in
+`cli.py`'s `_handle_confirm` (typing `a` at an edit prompt), which was likewise deliberately never
+extended to commands or Git — Auto mode is that same scope decision made persistent and explicit
+instead of a new risk categorization.
+
+The actual mechanism lives entirely in `run_agent_turn()` (`agent/loop.py`), which takes an
+additive `auto_approve_edits: bool = False` parameter (default is a no-op for every existing
+caller/test). In the `confirm` and `confirm_plan` blocks only, when `auto_approve_edits` is set,
+`approved` is resolved to `True` **before** the yield rather than depending on whatever the caller
+sends back:
+
+```python
+if auto_approve_edits:
+    approved = True
+    yield {"type": "confirm", "name": name, "change": change, "auto_approved": True}
+else:
+    approved = yield {"type": "confirm", "name": name, "change": change}
+```
+
+The event is still emitted either way (so any caller can render what happened), but the approval
+decision no longer depends on caller cooperation — even a caller unaware of `auto_approved` can, at
+worst, show a redundant prompt, never accidentally skip a real approval or block forever. The
+`confirm_command` and `confirm_git_operation` blocks are untouched — no parameter reaches them, so
+there is no code path by which Auto mode can affect a command or a Git operation.
+
+`agent/server.py`'s `Session` dataclass carries the mode (`mode: str = "manual"`), set via
+`POST /task/mode` and reported back through `GET /task/status`; `SessionStore.reset()` deliberately
+does not touch it, so the mode persists across `/task/new`/New Task (it's a UI preference, not task
+data) but always starts `"manual"` the first time a session is created — safety-by-default on every
+fresh `code-agent serve` start or newly opened workspace. `cli.py` keeps the equivalent as a plain
+local variable in `main()`'s loop, toggled by `/auto`/`/manual`, with the same survive-`/new`,
+reset-on-restart behavior. If you add a new confirm-shaped event type in the future, default it to
+requiring approval and only wire it into `auto_approve_edits` after deliberately deciding it belongs
+in the same risk class as a file edit — not by default inclusion.
 
 ### Tool system
 
@@ -238,8 +287,18 @@ does mean **a chat transcript claiming success is not evidence of success** — 
 "why didn't my edit/command/Git operation happen," check for an actual `confirm`/`confirm_command`/
 `confirm_git_operation` event in the transcript (or a `change_applied`/`command_result`/
 `git_operation_applied` one), not just the model's prose, and independently re-check real state
-(`git status`, the file on disk) rather than trusting either the model's or your own assumption. The
-system prompt already instructs the model not to do this; a small model doesn't always comply.
+(`git status`, the file on disk) rather than trusting either the model's or your own assumption.
+
+A related but distinct variant, seen live via user reports: instead of fabricating a fake
+`<tool_response>`, the model sometimes never attempts a tool call at all — it prints the proposed
+new file content or a `diff`-fenced code block as plain chat text and asks "Would you like me to
+save this?", and keeps doing so turn after turn even when the user replies "yes"/"proceed", because
+each reply just becomes more conversation for it to narrate over rather than a trigger to call
+edit_file/write_file. `SYSTEM_PROMPT_TEMPLATE` (`agent/cli.py`) now has an explicit instruction
+against this — "call edit_file or write_file immediately... your very next output must be the tool
+call itself, not another description" — mirrored for `run_command`/Git in the paragraph right after
+the Git section. This materially reduces the failure rate but does not eliminate it; the system
+prompt already instructs the model not to do this either way, a small model doesn't always comply.
 
 ### Rich markup escaping
 
@@ -385,3 +444,143 @@ the word "token" (a real false positive caught during Phase 8 manual testing: "M
 Authorization bearer token." was getting partially redacted before the length threshold was added).
 If you add a new secret-shaped pattern, keep that same defense-in-depth framing — the actual guarantee
 is still "this codebase doesn't log raw request bodies/env dumps/file contents," not the regex.
+
+### Phase 9: context, performance & Qwen 3B optimization
+
+**Before touching this area, know what Phases 1–8 already built**, verified by direct code reading
+rather than assumed: `context_manager.py`'s `compact_messages()` already enforces a 12,000-char
+whole-conversation budget (`MAX_CONTEXT_CHARS`) with a protected floor of the most recent 6 tool
+messages, already retroactively placeholders a superseded duplicate `read_file` or one invalidated
+by a later `edit_file`/`write_file`, and `TaskState.summarize()` was already bounded per-category
+and regenerated (never appended) into the system prompt every iteration. Every tool output already
+had a real cap before Phase 9: `run_command` stdout/stderr (12K chars each), `git_diff` (8K),
+`git_log` (≤20 entries), `read_file` (200KB/20MB/800-line tiers), `list_files` (≤400 entries),
+`search_files` (≤50 results, 5/file, 200-char previews) — and the model never saw a raw diff at all,
+only a one-line confirmation after `edit_file`/`write_file`. Phase 9 did not rebuild any of this; it
+closed the gaps a careful read of that existing code actually found.
+
+**What Phase 9 explicitly evaluated and did NOT change, and why:**
+- Reordering `messages` by priority category (a literal reading of "consistent context order"):
+  `context_manager._iter_tool_messages_with_args` depends on strict chronological
+  assistant-tool_calls ↔ tool-result pairing. Reordering the real conversation list would break that
+  pairing — a correctness regression far worse than any latency gain. The system prompt's own
+  internal section order is where "consistent order" safely applies.
+- Rewriting all 16 tool descriptions to be shorter: they're already 200–470 chars and were shaped by
+  live-testing Qwen's tool-calling quirks (see the sections above). Shrinking them risks the exact
+  reliability regression this phase's own "revert if it hurts reliability" rule exists to prevent.
+  Only a short additive tool-selection paragraph was added to the system prompt instead.
+- Partial (head+tail) truncation in `compact_messages` pass 2, instead of the existing all-or-nothing
+  placeholder: unverified upside against a well-tested, working path — left as-is.
+
+**The unchanged-file read cache (the main new mechanism) reuses two already-correct primitives
+instead of inventing new state.** `tools/filesystem.py`'s `_read_file` short-circuits a **full**
+(non-ranged) `read_file` call to a short "unchanged since you last read it" notice — instead of
+resending the whole file — when: `task_state is not None`, the path is still in
+`task_state.files_inspected` (already removed by `note_file_modified()` the moment the agent edits
+that file — the existing cache-invalidation contract, not new), and `tracker.is_fresh(path,
+current_disk_content)` is true (already-existing SHA-256 comparison against the hash **recorded
+before** this read, so it also catches a file changed outside the agent's own edits — e.g. the user
+editing it directly — not just edits the agent itself made). A new `force: bool` arg on
+`ReadFileArgs` bypasses it. This makes `read_file` the **second** documented, narrow exception to
+"tools don't know about `TaskState`" (the first being `update_plan`/`get_plan`) — `task_state` is
+threaded into `build_read_file_tool()` in `agent/tools/__init__.py`'s `build_default_registry()`
+for exactly this, read-only.
+
+**Why `is_fresh()` must be checked before `tracker.record()`, not after.** `_read_file` computes
+`is_cache_hit` from the *previously* recorded hash before calling `tracker.record()` with the
+current content. Reversing that order would make `is_fresh()` trivially true right after recording
+(you'd be comparing content against its own just-recorded hash), silently breaking external-drift
+detection — a file changed outside the agent's own tools would then wrongly short-circuit as
+"unchanged." `tests/test_tools_filesystem.py::TestReadFileCache` locks this ordering in directly
+(`test_cache_miss_after_external_disk_modification`).
+
+**A cache-hit result never gets confused with a real one downstream.** `ToolResult` gained a new
+optional `cache_hit: Optional[bool] = None` field (same additive pattern as Phase 8's
+`error_type`/`recoverable` — default `None`, every pre-Phase-9 `ToolResult` call site unaffected).
+`loop.py` copies it onto the `messages` dict it appends (`msg["cache_hit"] = True`, a non-standard
+extra key on the tool-role dict, same precedent as the existing `tool_name` key Ollama's own schema
+doesn't require). **This is what fixes a real bug that would otherwise exist**: `compact_messages`'s
+pass 1 supersedes an *older* `read_file` result once a *newer* one for the same path appears — but
+if that "newer" one is only a cache-hit stub with no real content, superseding the older real read
+would leave the model with **zero copies** of the file anywhere in context. Pass 1 now checks
+`msg.get("cache_hit")` and skips superseding (and skips advancing its own bookkeeping index) when
+the newer occurrence is a stub — the *real* older read stays live until an actual subsequent real
+read supersedes it. `tests/test_context_manager.py::TestCompactMessagesCacheHitAware` and
+`tests/test_loop.py::TestReadFileCacheIntegration` cover this end to end, not just at the unit level.
+
+**`compact_messages()` now returns a `CompactionStats` (superseded/stale/trimmed counts) instead of
+`None`** — purely additive; every caller that ignored the return value before still works. Used only
+for the debug-mode summary below and for tests asserting on what actually got compacted, rather than
+just that the resulting message list looks right.
+
+**Debug-mode performance surface, not a new event type.** `run_agent_turn()`'s entire iteration loop
+is now wrapped in `try/.../finally`, guaranteeing exactly one `logger.debug(...)` summary line per
+turn (context chars/estimated tokens, LLM-call count, tool-call count, cache hits/misses,
+superseded/stale/trimmed counts) regardless of which of the many exit paths (final, error,
+cancelled, max_iterations) actually fired — this reuses Phase 8's existing `get_logger`/
+`configure_logging(debug=...)` plumbing (already redaction-filtered, already gated behind
+`--debug`/`CODE_AGENT_DEBUG=1`) rather than inventing a new structured-debug subsystem or a new
+event type the VS Code extension/CLI would need to learn about. If you add a fourth "apply"-style
+early-return path to `run_agent_turn` in the future, it's automatically covered by the same
+`finally` — no separate logging call needed at the new return site.
+
+**Token estimation (`agent/context_budget.py`) is a reporting layer only — it does not replace the
+proven char-based enforcement.** `estimate_tokens`/`estimate_tokens_from_chars` are a bare `len(text)
+/ 4` heuristic (`CHARS_PER_TOKEN_ESTIMATE = 4`), used only for the debug log line and the
+benchmark's `estimated_peak_context_tokens` metric. `compact_messages`'s actual budget enforcement is
+still pure character counting, unchanged — don't wire the token estimate into any enforcement path;
+it was deliberately kept decorative because the char-based budget is already tuned and tested, and
+"approximately right token count for display" and "hard enforcement threshold" have different
+accuracy requirements.
+
+**`CODE_AGENT_MAX_CONTEXT_CHARS` follows the exact `OLLAMA_TIMEOUT`/`timeout_from_env()` pattern**
+(`context_budget.max_context_chars_from_env()`: tolerant parsing, falls back to
+`context_manager.MAX_CONTEXT_CHARS` on a missing/non-numeric/non-positive value). `run_agent_turn()`
+gained a `max_context_chars` parameter (default unchanged) threaded straight into its
+`compact_messages()` call; `cli.py`/`server.py` each read the env var once at startup (mirroring
+exactly how they already read `OLLAMA_TIMEOUT`) and pass it down through `render_turn()`/the
+per-request `run_agent_turn()` call respectively.
+
+**`TaskState`'s underlying list storage is now capped at the source (`_MAX_STORED = 50`), not just
+`summarize()`'s display slice.** Before Phase 9, `commands_executed`/`errors_encountered`/
+`git_operations`/`files_inspected` grew without bound in memory for the life of a long-running task
+even though only the last few of each were ever shown — `summarize()`'s existing per-category
+display caps (`MAX_FILES_IN_SUMMARY` etc.) are untouched; this only bounds what's held in the Python
+list itself.
+
+**`git_status` gained `MAX_STATUS_ENTRIES_PER_CATEGORY` (mirroring `list_files`'s
+`MAX_LIST_ENTRIES` pattern exactly)** — it was the one tool output with no cap at all before Phase
+9; a huge uncommitted change (thousands of untracked files) would otherwise list every single path.
+
+**The benchmark harness (`agent/benchmark.py`) was extended in place, not replaced.** `TaskResult`
+gained `llm_calls`, `peak_context_chars`, `estimated_peak_context_tokens`,
+`time_to_first_token_seconds`, `peak_rss_bytes` — all with safe defaults so a pre-Phase-9 saved
+report still loads. `_RecordingClient.chat()` already saw `messages` on every call, so per-call
+context size and the first-streamed-update timing are computed there with no changes needed to
+`loop.py`/`context_manager.py` for those two metrics specifically. The JSON report shape changed
+from a bare array to `{"model", "host", "timestamp", "tasks": [...]}` (a real gap: nothing
+previously identified which run/model produced a saved report) — `_load_report()` tolerates both
+shapes so a genuine pre-Phase-9 baseline file (captured deliberately, per this phase's own
+baseline-first requirement, **before** any of these changes were made) still works with the new
+`--compare BEFORE.json AFTER.json` mode. Two new tasks were added following the exact same
+`_setup_fixture_project`-based pattern as the original six: **Relevant file selection** (a fixture
+with deliberately irrelevant noise files — `frontend/`, `package-lock.json`, `vendor/` — checked via
+`_NOISE_PATH_MARKERS` against every `tool_call` event's `path` argument, not by inspecting model
+prose) and **Stuck/repetition recovery** (a request whose literal `old_text` doesn't exist in the
+target file, designed to provoke Phase 8's `MAX_CONSECUTIVE_IDENTICAL_CALLS` repetition-detection
+mechanism; the check only requires the turn to recover with a clean final answer rather than hitting
+`max_iterations`, regardless of whether `repetition_detected` specifically fired, since a model that
+avoids the repeated call in the first place is an equally valid "recovery").
+
+**`peak_rss_bytes` is a process-wide high-water mark (`resource.getrusage(...).ru_maxrss`), not a
+clean per-task delta** — reading it after each task still gives a useful monotonically-growing
+signal across one benchmark run, but callers displaying it should say so. Units differ by platform:
+bytes on macOS (the target hardware), KB on Linux.
+
+**A real, honest baseline exists from before any Phase 9 code changed**, captured per this phase's
+own explicit process requirement (baseline first, never claim an improvement the numbers don't
+demonstrate): only 1/6 original tasks passed against the live `qwen2.5-coder:3b` setup at the time,
+dominated by the model narrating/failing to call tools correctly rather than by anything Phase 9
+touches — see the actual before/after numbers reported to the user rather than duplicating them
+here, since real model behavior varies run to run and this file should not go stale with one
+snapshot's numbers.

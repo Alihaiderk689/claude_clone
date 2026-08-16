@@ -20,6 +20,7 @@ from ..project import (
     PathSecurityError,
     ProjectRoot,
 )
+from ..task_state import TaskState
 from .base import NotFoundError, PermissionDeniedError, Tool, ToolError, ToolResult
 from .state import FileStateTracker
 
@@ -44,6 +45,14 @@ class ReadFileArgs(BaseModel):
     )
     end_line: Optional[int] = Field(
         default=None, ge=1, description="Last line to read, 1-indexed and inclusive."
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "Set true to force a fresh full read even if this file was already read earlier in "
+            "this conversation and hasn't changed since. Not needed normally -- an unchanged "
+            "file's content is already available from the earlier read."
+        ),
     )
 
 
@@ -117,7 +126,10 @@ def _list_files(project: ProjectRoot, args: ListFilesArgs) -> ToolResult:
 
 
 def _read_file(
-    project: ProjectRoot, tracker: Optional[FileStateTracker], args: ReadFileArgs
+    project: ProjectRoot,
+    tracker: Optional[FileStateTracker],
+    args: ReadFileArgs,
+    task_state: Optional[TaskState] = None,
 ) -> ToolResult:
     target = _safe_resolve(project, args.path)
 
@@ -158,11 +170,39 @@ def _read_file(
     except PermissionError as exc:
         raise PermissionDeniedError(f"Permission denied reading '{args.path}': {exc}") from exc
 
+    # Phase 9 unchanged-file short-circuit: check freshness against the
+    # PREVIOUSLY recorded hash before it gets overwritten below -- this is
+    # what lets it also catch an external modification (disk content
+    # changed without going through edit_file/write_file, so files_inspected
+    # alone wouldn't know), not just "hasn't been edited by this agent."
+    # Full reads only: a ranged read's cache semantics would be ambiguous
+    # (was this exact range shown before, or a different one?).
+    is_cache_hit = (
+        not wants_range
+        and not args.force
+        and task_state is not None
+        and tracker is not None
+        and args.path in task_state.files_inspected
+        and tracker.is_fresh(target, text)
+    )
+
     # Record against the full content regardless of range, so a later
     # edit_file call can detect drift anywhere in the file, not just in
     # whatever slice was shown here.
     if tracker is not None:
         tracker.record(target, text)
+
+    if is_cache_hit:
+        return ToolResult(
+            ok=True,
+            output=(
+                f"'{args.path}' is unchanged since you last read it in this conversation "
+                "(content hash matches). Reuse the version already shown above -- no need to "
+                "read it again unless you think it's stale; pass force=true to re-read anyway."
+            ),
+            display=f"read_file({args.path!r}) [cached]",
+            cache_hit=True,
+        )
 
     lines = text.splitlines()
     total_lines = len(lines)
@@ -206,14 +246,20 @@ def build_list_files_tool(project: ProjectRoot) -> Tool:
     )
 
 
-def build_read_file_tool(project: ProjectRoot, tracker: Optional[FileStateTracker] = None) -> Tool:
+def build_read_file_tool(
+    project: ProjectRoot,
+    tracker: Optional[FileStateTracker] = None,
+    task_state: Optional[TaskState] = None,
+) -> Tool:
     return Tool(
         name="read_file",
         description=(
             "Read the contents of a single file inside the project, relative to the project root. "
             "Returns line-numbered text. For large files, pass start_line/end_line to read a "
-            "portion instead of guessing; the tool will tell you if a full read is too large."
+            "portion instead of guessing; the tool will tell you if a full read is too large. If "
+            "you already read this exact file earlier and it hasn't changed, this returns a short "
+            "'unchanged' notice instead of the full content again -- reuse what you already have."
         ),
         args_model=ReadFileArgs,
-        run=lambda args: _read_file(project, tracker, args),
+        run=lambda args: _read_file(project, tracker, args, task_state),
     )

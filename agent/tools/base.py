@@ -119,6 +119,12 @@ class ToolResult:
     # approve on a bare Enter (a plan has no side effects of its own; approving
     # it is not permission to skip file/command/Git approvals).
     pending_plan: Optional[Plan] = None
+    # Phase 9: set only by read_file, only on success, when it short-circuited
+    # a redundant full read of an unchanged file instead of resending the
+    # whole file again -- see tools/filesystem.py's _read_file. None for
+    # every other tool and for a real (non-cached) read_file result; treat
+    # None as "not applicable", not as "cache miss".
+    cache_hit: Optional[bool] = None
 
 
 @dataclass(frozen=True)

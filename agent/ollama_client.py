@@ -7,6 +7,7 @@ raise a specific exception describing what went wrong.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from typing import Dict, Iterator, List, Optional
 
@@ -15,6 +16,21 @@ import requests
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5-coder:3b"
 DEFAULT_TIMEOUT = 120  # generation on CPU can be slow; keep this generous
+
+
+def timeout_from_env() -> float:
+    """Reads OLLAMA_TIMEOUT (seconds) the same way host/model read
+    OLLAMA_HOST/OLLAMA_MODEL. Falls back to DEFAULT_TIMEOUT for a missing,
+    non-numeric, or non-positive value rather than raising -- a bad env var
+    should degrade to the safe default, not crash startup."""
+    raw = os.environ.get("OLLAMA_TIMEOUT")
+    if not raw:
+        return DEFAULT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TIMEOUT
+    return value if value > 0 else DEFAULT_TIMEOUT
 
 
 class OllamaError(Exception):

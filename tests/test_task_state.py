@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from agent.planner import Plan, PlanStep
-from agent.task_state import CommandRecord, TaskState
+from agent.task_state import _MAX_STORED, CommandRecord, TaskState
 
 
 class TestFileTracking:
@@ -57,6 +57,48 @@ class TestCommandAndErrorTracking:
         ts = TaskState()
         ts.note_git_operation("Created commit abc123: Fix bug")
         assert ts.git_operations == ["Created commit abc123: Fix bug"]
+
+
+class TestBoundedStorage:
+    """Phase 9: storage itself is capped at _MAX_STORED, not just what
+    summarize() chooses to display -- a long-running task must not grow
+    these lists without bound in memory."""
+
+    def test_files_inspected_storage_is_capped(self):
+        ts = TaskState()
+        for i in range(_MAX_STORED + 20):
+            ts.note_file_inspected(f"file_{i}.py")
+        assert len(ts.files_inspected) == _MAX_STORED
+        # Most-recently-touched entries survive the trim.
+        assert ts.files_inspected[-1] == f"file_{_MAX_STORED + 19}.py"
+
+    def test_files_modified_storage_is_capped(self):
+        ts = TaskState()
+        for i in range(_MAX_STORED + 20):
+            ts.note_file_modified(f"file_{i}.py")
+        assert len(ts.files_modified) == _MAX_STORED
+        assert ts.files_modified[-1] == f"file_{_MAX_STORED + 19}.py"
+
+    def test_commands_executed_storage_is_capped(self):
+        ts = TaskState()
+        for i in range(_MAX_STORED + 20):
+            ts.note_command(CommandRecord(display=f"cmd {i}", exit_code=0, outcome="ok"))
+        assert len(ts.commands_executed) == _MAX_STORED
+        assert ts.commands_executed[-1].display == f"cmd {_MAX_STORED + 19}"
+
+    def test_errors_encountered_storage_is_capped(self):
+        ts = TaskState()
+        for i in range(_MAX_STORED + 20):
+            ts.note_error(f"error {i}")
+        assert len(ts.errors_encountered) == _MAX_STORED
+        assert ts.errors_encountered[-1] == f"error {_MAX_STORED + 19}"
+
+    def test_git_operations_storage_is_capped(self):
+        ts = TaskState()
+        for i in range(_MAX_STORED + 20):
+            ts.note_git_operation(f"git op {i}")
+        assert len(ts.git_operations) == _MAX_STORED
+        assert ts.git_operations[-1] == f"git op {_MAX_STORED + 19}"
 
 
 class TestHasContent:
