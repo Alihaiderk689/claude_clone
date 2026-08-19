@@ -86,6 +86,16 @@ class TaskState:
         if path in self.files_inspected:
             self.files_inspected.remove(path)
 
+    def note_file_removed(self, path: str) -> None:
+        """A file that no longer exists (deleted, or renamed away from this
+        path) can't be trusted as "inspected" or "modified" anymore -- drop
+        both records for it, same rationale as note_file_modified's
+        files_inspected invalidation."""
+        if path in self.files_inspected:
+            self.files_inspected.remove(path)
+        if path in self.files_modified:
+            self.files_modified.remove(path)
+
     def note_command(self, record: CommandRecord) -> None:
         self.commands_executed.append(record)
         _trim(self.commands_executed)

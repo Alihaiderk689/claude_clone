@@ -25,12 +25,20 @@ from .ollama_client import (
 )
 from .task_state import TaskState
 from .tools.editing import apply_change
+from .tools.file_ops import apply_file_op
 from .tools.git import apply_git_operation
 from .tools.registry import ToolRegistry
 from .tools.state import FileStateTracker
 from .tools.terminal import describe_command, execute_command, format_result_for_model
 
-MAX_TOOL_ITERATIONS = 10
+# Raised from an earlier, much tighter 10: a multi-file task (read a file,
+# create a replacement, update references, delete the original, run tests)
+# routinely needs 8-10 tool calls on its own even when the model behaves
+# perfectly first try; add narration-correction retries (see
+# MAX_NARRATION_RETRIES below) or one re-read after an unexpected tool
+# error and the old limit was routinely too tight for exactly the kind of
+# task this agent is meant to handle end-to-end without a new user message.
+MAX_TOOL_ITERATIONS = 25
 
 # Retries only ever apply to OllamaConnectionError/OllamaTimeoutError -- both
 # are transient (server hiccup, momentary network blip) and a second attempt
@@ -46,6 +54,64 @@ OLLAMA_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 # attempted this many times in a row within one turn, the loop stops
 # executing it again and tells the model to change approach instead.
 MAX_CONSECUTIVE_IDENTICAL_CALLS = 3
+
+# Tool names whose successful proposal represents real progress toward a
+# requested change -- used only to gate narration-vs-tool-call detection
+# below (see _looks_like_unactioned_narration). Read-only inspection tools
+# (list_files, read_file, search_files, git_status/diff/log) deliberately do
+# NOT count: calling them and then stopping to ask "what next?" is exactly
+# the failure mode this guards against, observed live as
+# read_file -> read_file[cached] -> "What would you like me to do next?"
+# with zero mutating tool calls anywhere in the turn.
+MUTATING_TOOL_NAMES = frozenset(
+    {
+        "edit_file", "write_file", "delete_file", "rename_file", "run_command",
+        "git_create_branch", "git_stage", "git_commit", "git_push",
+    }
+)
+
+# How many times a plain-text response that reads as "I'll do X" / "what
+# would you like me to do next" (with no tool call anywhere yet this turn)
+# gets a corrective nudge instead of being accepted as the final answer. A
+# small model's own narration should never substitute for an actual
+# edit_file/write_file/delete_file/rename_file/run_command/git_* call -- see
+# _looks_like_unactioned_narration below. Bounded so a model that genuinely
+# can't comply still gets a real answer back (with task_incomplete flagged)
+# rather than looping forever.
+MAX_NARRATION_RETRIES = 2
+
+# Two independent signals, either one is enough to trigger a correction:
+# (1) the model is deferring back to the user for a decision it doesn't
+#     need ("what would you like me to do next?", "should I proceed?") when
+#     the user's request already told it what to do, and
+# (2) the model states a mutating intent in future/conditional tense
+#     ("I'll create...", "I will delete...") without having actually called
+#     the tool that would do it.
+# Deliberately narrow (specific phrases / verb list) rather than a broad
+# "contains I will" match -- a genuine informational answer to a real
+# question can legitimately contain similar phrasing, and this only matters
+# because it's bounded (MAX_NARRATION_RETRIES) and gated on no mutating tool
+# having run yet this turn (see run_agent_turn), so a false positive costs
+# at most a couple of extra, cheap local-model turns rather than corrupting
+# behavior.
+_DEFERRAL_RE = re.compile(
+    r"what (?:would|do) you (?:like|want)|what should i do next|let me know if you|"
+    r"should i (?:proceed|go ahead)|would you like me to|do you want me to",
+    re.IGNORECASE,
+)
+_UNACTIONED_INTENT_RE = re.compile(
+    r"\bi(?:'ll| will| am going to| plan to)\b[^.\n]{0,40}\b"
+    r"(create|write|add|update|edit|modify|delete|remove|rename|move|implement)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_unactioned_narration(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    return bool(_DEFERRAL_RE.search(text) or _UNACTIONED_INTENT_RE.search(text))
+
 
 _logger = get_logger("loop")
 
@@ -91,6 +157,15 @@ def run_agent_turn(
             `auto_approve_edits` below.
         {"type": "change_applied", "name", "path"}   -- approved, written, verified
         {"type": "change_rejected", "name", "path"}  -- user declined; untouched
+        {"type": "confirm_file_op", "name", "operation"}   -- delete_file/rename_file
+            proposed a filesystem mutation (see file_ops.ProposedFileOp); the caller
+            MUST send back True (apply) or False (reject) via generator.send(). THE
+            MODEL NEVER TOUCHES THE FILESYSTEM -- this pause, and an explicit True,
+            is the only path to apply_file_op() actually calling os.remove/os.rename.
+            Same `auto_approved` behavior as `confirm` when `auto_approve_edits` is
+            set -- delete/rename are treated as the same risk class as edit/write.
+        {"type": "file_op_applied", "name", "operation"}   -- approved and done
+        {"type": "file_op_rejected", "name", "operation"}  -- user declined; untouched
         {"type": "confirm_command", "name", "command"}   -- run_command proposed a
             command; the caller MUST send back True (run) or False (reject) via
             generator.send(). THE MODEL NEVER EXECUTES ANYTHING -- this pause,
@@ -118,7 +193,19 @@ def run_agent_turn(
         {"type": "plan_approved", "name", "plan"}     -- adopted into task_state
         {"type": "plan_rejected", "name"}             -- user declined; discarded
         {"type": "content", "text"}   -- the final answer text to display
-        {"type": "final", "text"}     -- the complete final answer (same text)
+        {"type": "final", "text"}     -- the complete final answer (same text). Carries an
+            extra `"task_incomplete": True` field when the turn ended on a response that
+            still looks like unactioned narration (see MAX_NARRATION_RETRIES) after
+            every corrective retry was exhausted -- a signal for the caller to flag
+            this to the user, not just print it as an ordinary answer. Absent (not
+            `False`) in the normal case, so existing callers that don't check for it
+            behave exactly as before.
+        {"type": "narration_redirected", "text", "attempt", "max_attempts"}  -- the model
+            produced a plain-text response with no tool call that reads as unactioned
+            narration ("I'll create...", "what would you like me to do next?") while no
+            mutating tool has run yet this turn; a corrective instruction was injected
+            and the turn continues (not a terminal event) -- see
+            _looks_like_unactioned_narration and MUTATING_TOOL_NAMES above.
         {"type": "error", "message"}  -- fatal Ollama error; turn stops
         {"type": "max_iterations"}    -- safety limit hit without a final answer
         {"type": "cancelled"}         -- cancel_event was set; turn stopped early
@@ -148,7 +235,9 @@ def run_agent_turn(
     server's Stop Task endpoint (agent/server.py). Left as None (the
     default), this has no effect on existing callers.
 
-    If `auto_approve_edits` is True, `confirm` (edit_file/write_file) and
+    If `auto_approve_edits` is True, `confirm` (edit_file/write_file),
+    `confirm_file_op` (delete_file/rename_file -- same risk class as an edit:
+    reversible via Git, no command execution, no Git state change), and
     `confirm_plan` events resolve to an internal `True` *before* the yield,
     rather than depending on whatever the caller sends back -- so a caller
     that doesn't specifically handle `auto_approved` still can't
@@ -179,6 +268,15 @@ def run_agent_turn(
     # change approach instead of burning the whole iteration budget on it.
     last_call_signature: Optional[tuple] = None
     consecutive_call_count = 0
+
+    # Narration-vs-tool-call guard (see MUTATING_TOOL_NAMES/MAX_NARRATION_RETRIES
+    # above): tracked across the whole turn, not just one iteration, so a
+    # response that comes back with zero tool calls after a read_file/
+    # search_files-only prelude is still recognized as "nothing was actually
+    # done yet" -- exactly the reported failure (two read_file calls, then
+    # plain-text narration).
+    mutating_tool_called_this_turn = False
+    narration_retry_count = 0
 
     # Phase 9 debug-mode stats (agent/logging_config.py's --debug /
     # CODE_AGENT_DEBUG=1) -- accumulated across the whole turn and logged
@@ -262,10 +360,49 @@ def run_agent_turn(
                     full_content = ""  # it was a tool-call attempt, not a message to show
 
             if not tool_calls:
+                needs_correction = (
+                    not mutating_tool_called_this_turn
+                    and narration_retry_count < MAX_NARRATION_RETRIES
+                    and _looks_like_unactioned_narration(full_content)
+                )
+                if needs_correction:
+                    narration_retry_count += 1
+                    _logger.info(
+                        "Narration without a tool call detected (attempt %d/%d); redirecting instead "
+                        "of accepting it as the final answer.",
+                        narration_retry_count, MAX_NARRATION_RETRIES,
+                    )
+                    messages.append({"role": "assistant", "content": full_content})
+                    if narration_retry_count == 1:
+                        correction = (
+                            "The requested change has not been performed yet. Continue the task by "
+                            "using the appropriate tool now (edit_file, write_file, delete_file, "
+                            "rename_file, or run_command) instead of describing or asking about it."
+                        )
+                    else:
+                        correction = (
+                            "You still have not called a tool. Stop explaining what you would do and "
+                            "call the tool that actually performs the change in your very next "
+                            "response -- no further description or questions."
+                        )
+                    messages.append({"role": "user", "content": correction})
+                    yield {
+                        "type": "narration_redirected",
+                        "text": full_content,
+                        "attempt": narration_retry_count,
+                        "max_attempts": MAX_NARRATION_RETRIES,
+                    }
+                    continue
+
                 if full_content:
                     yield {"type": "content", "text": full_content}
                 messages.append({"role": "assistant", "content": full_content})
-                yield {"type": "final", "text": full_content}
+                final_event = {"type": "final", "text": full_content}
+                if narration_retry_count >= MAX_NARRATION_RETRIES and _looks_like_unactioned_narration(
+                    full_content
+                ):
+                    final_event["task_incomplete"] = True
+                yield final_event
                 return
 
             messages.append(
@@ -316,6 +453,9 @@ def run_agent_turn(
                     messages.append({"role": "tool", "tool_name": name, "content": tool_output})
                     continue
 
+                if name in MUTATING_TOOL_NAMES:
+                    mutating_tool_called_this_turn = True
+
                 result = registry.execute(name, raw_args)
 
                 if name == "read_file" and result.ok:
@@ -342,6 +482,33 @@ def run_agent_turn(
                     else:
                         tool_output = "User rejected this change. The file was not modified."
                         yield {"type": "change_rejected", "name": name, "path": change.path}
+                elif result.ok and result.pending_file_op is not None:
+                    file_op = result.pending_file_op
+                    if auto_approve_edits:
+                        approved = True
+                        yield {
+                            "type": "confirm_file_op",
+                            "name": name,
+                            "operation": file_op,
+                            "auto_approved": True,
+                        }
+                    else:
+                        approved = yield {"type": "confirm_file_op", "name": name, "operation": file_op}
+                    if approved:
+                        apply_result = apply_file_op(file_op, tracker)
+                        if apply_result.ok:
+                            yield {"type": "file_op_applied", "name": name, "operation": file_op}
+                            context_manager.record_file_removed(task_state, file_op.source_path)
+                            if file_op.kind == "rename":
+                                context_manager.record_file_modified(
+                                    task_state, file_op.destination_path
+                                )
+                        else:
+                            yield {"type": "tool_error", "name": name, "message": apply_result.output}
+                        tool_output = apply_result.output
+                    else:
+                        tool_output = "User rejected this file operation. Nothing was changed."
+                        yield {"type": "file_op_rejected", "name": name, "operation": file_op}
                 elif result.ok and result.pending_command is not None:
                     cmd = result.pending_command
                     approved = yield {"type": "confirm_command", "name": name, "command": cmd}

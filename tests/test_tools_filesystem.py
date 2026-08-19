@@ -222,7 +222,8 @@ class TestReadFileCache:
         second = cached_read_tool.execute({"path": "README.md"})
         assert second.ok
         assert second.cache_hit is True
-        assert "unchanged since you last read it" in second.output
+        assert "status=unchanged" in second.output
+        assert "not" in second.output.lower() and "done" in second.output.lower()  # not framed as task-over
         assert "Sample project" not in second.output  # full content NOT resent
 
     def test_first_read_is_never_a_cache_hit(self, cached_read_tool):

@@ -7,24 +7,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A local, free, Claude Code–style coding assistant CLI (`code-agent`) that runs entirely against a
 local [Ollama](https://ollama.com) server and `qwen2.5-coder:3b` (default; `qwen2.5-coder:7b` also
 works, see README) — no cloud API, no key. It has read-only project inspection tools (including
-read-only Git inspection), approval-gated file-editing tools, one approval-gated command-execution
-tool, four approval-gated Git tools (branch/stage/commit/push), and planning tools for multi-step
-tasks (create_plan/update_plan/get_plan); the model can never write to disk, run a process, or
-change Git state without going through an explicit user approval — a plan cannot skip that either,
-it's just inert tracked data. As of Phase 7, the same agent is also reachable from a VS Code
-extension via a local-only HTTP server (`code-agent serve`, `agent/server.py`) — see "The VS Code
-integration layer" below; the terminal CLI itself is unchanged. As of Phase 8, failures at every
-layer (tool, Ollama, subprocess, HTTP) are classified and recovered from instead of being allowed
-to crash the agent or corrupt its state — see "Reliability and failure recovery (Phase 8)" below.
-`git_push` (added after Phase 8, by explicit request) is the one deliberate exception to "no
-remote operations" — see "Git push: narrow by design, not by accident" below for why it doesn't
-weaken the no-generic-git-command guarantee. Both the CLI and the VS Code extension also support a
-Manual/Auto approval-mode toggle (added by explicit request, see "Manual/Auto approval mode"
-below) — Auto only ever auto-approves file edits and plan approvals, never commands or Git. Phase 9
+read-only Git inspection), approval-gated file-mutation tools (edit_file/write_file/delete_file/
+rename_file), one approval-gated command-execution tool, four approval-gated Git tools
+(branch/stage/commit/push), and planning tools for multi-step tasks (create_plan/update_plan/
+get_plan); the model can never write to disk, delete or rename a file, run a process, or change Git
+state without going through an explicit user approval — a plan cannot skip that either, it's just
+inert tracked data. As of Phase 7, the same agent is also reachable from a VS Code extension via a
+local-only HTTP server (`code-agent serve`, `agent/server.py`) — see "The VS Code integration
+layer" below; the terminal CLI itself is unchanged. As of Phase 8, failures at every layer (tool,
+Ollama, subprocess, HTTP) are classified and recovered from instead of being allowed to crash the
+agent or corrupt its state — see "Reliability and failure recovery (Phase 8)" below. `git_push`
+(added after Phase 8, by explicit request) is the one deliberate exception to "no remote
+operations" — see "Git push: narrow by design, not by accident" below for why it doesn't weaken the
+no-generic-git-command guarantee. Both the CLI and the VS Code extension also support a Manual/Auto
+approval-mode toggle (added by explicit request, see "Manual/Auto approval mode" below) — Auto only
+ever auto-approves file edits/deletes/renames and plan approvals, never commands or Git. Phase 9
 closed real (verified, not assumed) context/performance gaps on top of Phases 1–8's already
 substantial context management — see "Phase 9: context, performance & Qwen 3B optimization" below
-for exactly what was already there versus what's genuinely new. See README.md for the full
-user-facing walkthrough, tool list, and phase-by-phase feature history.
+for exactly what was already there versus what's genuinely new. Phase 10 added `delete_file`/
+`rename_file` as first-class approval-gated tools (replacing "the agent literally cannot rename or
+remove a file" with a validated, structured alternative to routing through `run_command`'s
+`rm`/`mv`, which stay denylisted), a narration-vs-tool-call detection/correction mechanism in the
+agent loop, a cache-hit response redesign, and Ollama generation-parameter tuning aimed at more
+reliable tool-calling on the 3B model — see "Phase 10: autonomous filesystem operations and
+tool-calling reliability" below. See README.md for the full user-facing walkthrough, tool list, and
+phase-by-phase feature history.
 
 ## Commands
 
@@ -68,10 +75,32 @@ python -m agent.benchmark --output benchmark_report.json
 python -m agent.benchmark --compare before.json after.json  # diff two saved reports, no Ollama needed
 ```
 
-`OLLAMA_HOST` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen2.5-coder:3b`), and
+`OLLAMA_HOST` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen2.5-coder:3b`),
 `OLLAMA_TIMEOUT` (default `120` seconds, parsed by `ollama_client.py`'s `timeout_from_env()` --
-falls back to the default rather than raising on a missing/non-numeric/non-positive value) are the
-only configuration, set as environment variables. `code-agent serve` reads the same three.
+falls back to the default rather than raising on a missing/non-numeric/non-positive value), and
+`OLLAMA_KEEP_ALIVE` (default `30m`, parsed by `keep_alive_from_env()` following the identical
+tolerant-fallback pattern -- passed through as-is to Ollama's `keep_alive` field on every
+`/api/chat`/`/api/generate` call) are the only configuration, set as environment variables.
+`code-agent serve` reads the same four.
+
+**Cold model load is a real, previously-documented failure mode, not just a perf nit.** Ollama's own
+server default `keep_alive` is `5m` -- short enough that a normal pause between agent turns (reading
+a diff, deciding what to ask next) lets the model fall out of memory, so the next `/api/chat` call
+pays a multi-second-to-tens-of-seconds reload. Verified live (`ollama ps` / `load_duration` in the
+response) against `qwen2.5-coder:3b`: a genuinely cold load took ~6.4s of a ~7.5s total response
+time, vs. ~0.1s `load_duration` when already resident. On slower/more memory-constrained hardware or
+the 7B model this can exceed `OLLAMA_TIMEOUT`, which is what most "Connection to Ollama failed...
+Retrying" messages actually are -- not a real connectivity problem. Two fixes address this instead of
+just papering over it with a bigger timeout: `OllamaClient` now sends `keep_alive=OLLAMA_KEEP_ALIVE`
+(`30m` default, up from Ollama's own `5m`) on every chat request, so the model stays resident for the
+length of a normal session; and `OllamaClient.warm_up()` (a promptless `/api/generate` call, which
+Ollama loads the model for but never generates tokens against) is called once at CLI startup, behind
+a "Loading model into memory..." status spinner, right after `check_connection()` succeeds -- so the
+cold-load cost is paid once, up front, with honest messaging, instead of silently during the user's
+first real message where it looks like a failure. `warm_up()` failures are caught and shown as a
+yellow warning, not a hard exit -- pre-loading is a latency optimization, not a correctness
+requirement, and the existing per-turn retry loop in `loop.py` still covers a cold load that happens
+anyway.
 
 ## Architecture
 
@@ -83,36 +112,44 @@ printing anything. `agent/cli.py` is the only module that imports `rich` and doe
 just consumes those events. Keep that split — new UIs (or a future non-interactive mode) should be
 able to drive `run_agent_turn` without touching `cli.py`.
 
-### The propose → confirm → apply pipeline (the core mechanism, used four times)
+### The propose → confirm → apply pipeline (the core mechanism, used five times)
 
-`edit_file`/`write_file` (`agent/tools/editing.py`), `run_command` (`agent/tools/terminal.py`),
-`git_create_branch`/`git_stage`/`git_commit` (`agent/tools/git.py`), and `create_plan`
-(`agent/tools/planning.py`) never touch disk, spawn a process, run Git, or adopt a plan themselves.
-Each tool's `run()` only validates and builds a description of the pending action in memory —
-`ProposedChange` (`agent/diff.py`), `ApprovedCommand` (`agent/command_policy.py`),
-`ProposedGitOperation` (`agent/git_policy.py`), or a plain `Plan` (`agent/planner.py`) — set on
-`ToolResult.pending_change` / `.pending_command` / `.pending_git_operation` / `.pending_plan`
-respectively. When `run_agent_turn` sees any of those fields set, it does `approved = yield {"type":
-"confirm"/"confirm_command"/"confirm_git_operation"/"confirm_plan", ...}` — a real pause using
-Python's generator `send()` protocol. `cli.py` renders the diff/command/Git operation/plan, prompts,
-and resumes the generator with `gen.send(approved)`. Only a `True` from that send leads to
-`apply_change()` (atomic temp-file write + fsync + verify-by-read-back), `execute_command()`
-(`subprocess.run([program, *args], shell=False, ...)`), `apply_git_operation()` (`git
-branch`/`git add`/`git commit`, also never through a shell), or (for a plan) `run_agent_turn` itself
-setting `task_state.plan = plan` directly, actually acting. There is no code path from the model
-straight to disk, to a subprocess, to Git, or into `task_state` — a new mutating/executing/adopting
-tool must follow this same propose/apply split, not act directly in its `run()`.
+`edit_file`/`write_file`/`delete_file`/`rename_file` (`agent/tools/editing.py`,
+`agent/tools/file_ops.py`), `run_command` (`agent/tools/terminal.py`), `git_create_branch`/
+`git_stage`/`git_commit` (`agent/tools/git.py`), and `create_plan` (`agent/tools/planning.py`) never
+touch disk, spawn a process, run Git, or adopt a plan themselves. Each tool's `run()` only validates
+and builds a description of the pending action in memory — `ProposedChange` (`agent/diff.py`),
+`ProposedFileOp` (`agent/file_ops.py` — delete/rename only; no textual diff to show, so it's a
+separate dataclass rather than being folded into `ProposedChange`), `ApprovedCommand`
+(`agent/command_policy.py`), `ProposedGitOperation` (`agent/git_policy.py`), or a plain `Plan`
+(`agent/planner.py`) — set on `ToolResult.pending_change` / `.pending_file_op` / `.pending_command` /
+`.pending_git_operation` / `.pending_plan` respectively. When `run_agent_turn` sees any of those
+fields set, it does `approved = yield {"type":
+"confirm"/"confirm_file_op"/"confirm_command"/"confirm_git_operation"/"confirm_plan", ...}` — a real
+pause using Python's generator `send()` protocol. `cli.py` renders the diff/path-or-rename/command/
+Git operation/plan, prompts, and resumes the generator with `gen.send(approved)`. Only a `True` from
+that send leads to `apply_change()` (atomic temp-file write + fsync + verify-by-read-back),
+`apply_file_op()` (`os.remove`/`os.rename`, each re-checking the target still exists / destination
+still doesn't right before acting — same stale-proposal defense as `apply_git_operation`'s
+re-checked staged-files/branch), `execute_command()` (`subprocess.run([program, *args], shell=False,
+...)`), `apply_git_operation()` (`git branch`/`git add`/`git commit`, also never through a shell), or
+(for a plan) `run_agent_turn` itself setting `task_state.plan = plan` directly, actually acting.
+There is no code path from the model straight to disk, to a subprocess, to Git, or into `task_state`
+— a new mutating/executing/adopting tool must follow this same propose/apply split, not act directly
+in its `run()`.
 
 Because of this, `cli.py`'s event loop can't be a plain `for event in run_agent_turn(...)` — it uses
-`gen.send(value)` manually so it can answer `confirm`/`confirm_command`/`confirm_git_operation`/
-`confirm_plan` events (see `render_turn`). Note the asymmetries: file-edit approval supports
-`y`/`n`/`a` (`a` = approve all remaining changes this turn); command and Git approval are strictly
-`y`/`n` with no batch-approve; **plan approval is the one prompt in the whole app where a bare Enter
-means yes** (`_ask_plan_approval` in `cli.py`) — deliberate, since a `Plan` object carries no path,
-command, or Git ref, nothing capable of touching anything on its own. Don't "fix" that asymmetry;
-it's intentional. Staging a file matching a sensitive pattern additionally swaps the normal "Stage
-these files?" prompt for an explicit "WARNING: ... Are you sure ...?" one (still defaults to reject)
-— see `_handle_git_confirm` in `cli.py`.
+`gen.send(value)` manually so it can answer `confirm`/`confirm_file_op`/`confirm_command`/
+`confirm_git_operation`/`confirm_plan` events (see `render_turn`). Note the asymmetries: file-edit
+and file-op (delete/rename) approval share one `y`/`n`/`a` prompt and one `turn_state["approve_all"]`
+flag (`a` = approve all remaining edits/deletes/renames this turn — the same risk class, see
+`_handle_file_op_confirm` in `cli.py`); command and Git approval are strictly `y`/`n` with no
+batch-approve; **plan approval is the one prompt in the whole app where a bare Enter means yes**
+(`_ask_plan_approval` in `cli.py`) — deliberate, since a `Plan` object carries no path, command, or
+Git ref, nothing capable of touching anything on its own. Don't "fix" that asymmetry; it's
+intentional. Staging a file matching a sensitive pattern additionally swaps the normal "Stage these
+files?" prompt for an explicit "WARNING: ... Are you sure ...?" one (still defaults to reject) — see
+`_handle_git_confirm` in `cli.py`.
 
 `command_policy.py`/`git_policy.py` (validation, allowlists, argument-shape rules, injection checks
 — never execute anything) and `agent/tools/terminal.py`/`agent/tools/git.py` (execution only, given
@@ -142,22 +179,29 @@ or a `refspec`/`branch` override to `GitPushArgs` — don't; that's exactly the 
 would turn this from "narrow tool" back into "generic executor," which is the one thing this
 codebase has held the line on since Phase 5.
 
-### Manual/Auto approval mode: scoped to edits and plans, never commands or Git
+### Manual/Auto approval mode: scoped to edits (including delete/rename) and plans, never commands or Git
 
 Both the CLI (`/auto`, `/manual`) and the VS Code extension (the Manual/Auto toggle in the status
-bar) offer a persistent mode that changes how `confirm`/`confirm_plan` events are resolved — nothing
-else. **Auto mode auto-approves file edits and plan approvals only. `run_command` and every Git
-operation (including `git_push`) always require individual approval, regardless of mode, with no
-way to disable that.** This mirrors the pre-existing `approve_all`/`a` "approve all" mechanism in
-`cli.py`'s `_handle_confirm` (typing `a` at an edit prompt), which was likewise deliberately never
-extended to commands or Git — Auto mode is that same scope decision made persistent and explicit
-instead of a new risk categorization.
+bar) offer a persistent mode that changes how `confirm`/`confirm_file_op`/`confirm_plan` events are
+resolved — nothing else. **Auto mode auto-approves file edits, deletes, renames, and plan approvals
+only. `run_command` and every Git operation (including `git_push`) always require individual
+approval, regardless of mode, with no way to disable that.** `delete_file`/`rename_file` were added
+to this same scope deliberately, not as an oversight: a delete/rename is exactly the same risk class
+as an edit — a filesystem mutation, reversible via Git if the project is one, no command execution,
+no Git state change — so it belongs in the same auto-approval bucket rather than either forcing a
+manual approval Auto mode was supposed to remove, or (the wrong direction) folding it into the
+command/Git bucket that must never be auto-approved. This mirrors the pre-existing `approve_all`/`a`
+"approve all" mechanism in `cli.py`'s `_handle_confirm`/`_handle_file_op_confirm` (typing `a` at an
+edit OR a delete/rename prompt approves all remaining edits/deletes/renames this turn, sharing one
+`turn_state["approve_all"]` flag), which was likewise deliberately never extended to commands or
+Git — Auto mode is that same scope decision made persistent and explicit instead of a new risk
+categorization.
 
 The actual mechanism lives entirely in `run_agent_turn()` (`agent/loop.py`), which takes an
 additive `auto_approve_edits: bool = False` parameter (default is a no-op for every existing
-caller/test). In the `confirm` and `confirm_plan` blocks only, when `auto_approve_edits` is set,
-`approved` is resolved to `True` **before** the yield rather than depending on whatever the caller
-sends back:
+caller/test). In the `confirm`, `confirm_file_op`, and `confirm_plan` blocks only, when
+`auto_approve_edits` is set, `approved` is resolved to `True` **before** the yield rather than
+depending on whatever the caller sends back:
 
 ```python
 if auto_approve_edits:
@@ -584,3 +628,116 @@ dominated by the model narrating/failing to call tools correctly rather than by 
 touches — see the actual before/after numbers reported to the user rather than duplicating them
 here, since real model behavior varies run to run and this file should not go stale with one
 snapshot's numbers.
+
+### Phase 10: autonomous filesystem operations and tool-calling reliability
+
+Phase 9 closed context/performance gaps; Phase 10 targeted a different, live-observed problem: the
+model narrating an intended change ("I'll create sorting.py...", "What would you like me to do
+next?") instead of calling a tool, and the agent having no capability at all — not even a
+reliability gap — to fulfill a plain "rename this file" or "delete that file" request, since
+`command_policy.py`'s `run_command` allowlist deliberately excludes `rm`/`mv` and there was no
+structured alternative. Both problems compound on requests like "rename bubble_sort.py to
+sorting.py and add the other sorting algorithms," which is why that's the scenario
+`tests/test_loop.py::TestEndToEndSortingScenario` exercises end-to-end.
+
+**`delete_file`/`rename_file` are new tools, not a `run_command` allowlist change, by explicit
+requirement.** `agent/file_ops.py` (`ProposedFileOp`, `validate_delete`/`validate_rename`) mirrors
+`git_policy.py`'s split from `agent/tools/git.py` exactly: pure validation, no filesystem access,
+raising `FileOpError` with a model-facing explanation. `agent/tools/file_ops.py` builds the two
+tools and `apply_file_op()` — called directly from `loop.py` after approval, with no
+`Tool.execute()` safety net, so (like `apply_git_operation`) every failure mode is caught and turned
+into a `ToolResult` rather than left to raise. Deliberately file-only, not directory-capable — a
+recursive directory delete/move is a meaningfully larger blast radius than anything else this agent
+can do, and every real request this was built for (the sorting.py scenario, "rename app_old.py to
+app.py") only ever needs a single file. `rename_file` refuses to overwrite an existing destination
+(mirrors `write_file`'s existing "already exists → use edit_file instead" precedent) rather than
+supporting an implicit overwrite; `apply_file_op` also re-checks the destination immediately before
+renaming (mirrors `apply_git_operation`'s re-checked staged-files/branch) so a same-turn race can't
+silently clobber a file that appeared after the proposal was built. Both tools reject the project
+root itself and any sensitive-pattern path, same as `edit_file`/`write_file`. `FileStateTracker`
+already had a `forget(path)` method (added for a since-superseded purpose) that `apply_file_op` now
+uses for real — deleting forgets the source; renaming forgets both source and (harmlessly, since
+nothing was ever recorded there) destination, so a later stale-edit check against either path has
+nothing incorrect to compare against. `TaskState.note_file_removed()` / `context_manager.
+record_file_removed()` extend the existing `note_file_modified`-style invalidation pattern for a
+path that no longer exists rather than one that just changed. `compact_messages`'s pass 1
+(`agent/context_manager.py`) also now marks an earlier `read_file` result stale when the same path
+is later `delete_file`d or is the *source* of a `rename_file` (destination is never marked stale —
+it was never read under its new name) — a real gap Phase 9 didn't have a reason to close, since
+neither tool existed yet.
+
+**Narration-vs-tool-call detection is a heuristic safety net, not a replacement for prompt
+engineering.** `_looks_like_unactioned_narration()` (`agent/loop.py`) matches two narrow signal
+classes in a model response that produced zero tool calls: a deferring question ("what would you
+like me to do next?", "should I proceed?") and a stated-but-unactioned mutating intent ("I'll
+create...", "I will delete..."). Deliberately narrow phrase/verb matching, not a broad "contains
+'I will'" check — a genuine informational answer can legitimately contain similar phrasing, and
+this is safe to be imprecise about specifically because it's bounded (`MAX_NARRATION_RETRIES = 2`)
+and gated on `mutating_tool_called_this_turn` being `False` (tracked via `MUTATING_TOOL_NAMES`,
+which deliberately excludes read-only inspection tools — the actual live-observed bug was
+`read_file` → `read_file[cached]` → narration, i.e. tool calls happened but none of them were a
+mutation). A false positive costs at most a couple of extra local-model turns, never corrupts state,
+since narration redirection only ever adds a corrective `user`-role message and loops again — it
+never fabricates a tool call itself. On the 3rd unactioned response the turn *does* finalize (so the
+agent never hangs), but the `"final"` event carries `"task_incomplete": True`, which `cli.py` renders
+as a distinct yellow warning rather than a normal answer — the model's own prose is never treated as
+proof a mutation happened; only an actual `change_applied`/`file_op_applied`/`command_result`/
+`git_operation_applied` event is. This is additive to, not a replacement for, the pre-existing
+system-prompt instructions against narration (see "The model can narrate a fake tool result instead
+of calling the tool" above) — the prompt reduces how often it happens, this mechanism catches it
+when the prompt alone doesn't.
+
+**The cache-hit response was redesigned from a conversational sentence into structured status,
+after live evidence it was actively causing the exact failure it was trying to prevent.** The
+original Phase 9 message ("`'{path}' is unchanged since you last read it... reuse it`") reads to a
+3B model mid-task as "nothing left to do here" rather than "here's the file's status, continue" —
+observed live producing exactly the reported bug (agent stops and asks "what would you like me to
+do next?" right after a cache hit). `tools/filesystem.py`'s `_read_file` now returns a `path=...
+status=unchanged lines=N hash=...` line (structured, not prose) followed by an explicit "the task is
+NOT done yet, proceed" instruction. The full file content is deliberately still NOT resent on a
+cache hit — that would defeat the whole point of the cache (this is the same real content already
+sitting earlier in the conversation, which `compact_messages`'s existing cache-hit-aware pass-1 logic
+already keeps alive rather than superseding away, see Phase 9 above, unchanged by this phase) — the
+narration-detection mechanism above is the actual backstop if a small model still stalls after a
+cache hit despite the clearer wording, not a second copy of the file.
+
+**`MAX_TOOL_ITERATIONS` raised from 10 to 25.** A multi-file request (read the old file, create its
+replacement, update a reference, delete the original, run tests) routinely needs 8-10 real tool
+calls even when the model behaves perfectly on the first try; add narration-correction retries or
+one re-read after an unexpected tool error and 10 was routinely too tight for exactly the kind of
+task this agent is meant to complete end-to-end without a new user message (see "PRIMARY OBJECTIVE"
+in the spec this phase implements — multi-tool-call sequences must not be artificially cut short).
+`tests/test_stress.py`'s `MAX_TOOL_ITERATIONS`-based assertions import the real constant rather than
+a hardcoded number, so they scale automatically.
+
+**Ollama generation parameters are now explicitly set, not left at the model's own Modelfile
+default.** `OllamaClient` payloads now include `"options": {"temperature": ..., "top_p": ...}`
+(`DEFAULT_TEMPERATURE = 0.2`, `DEFAULT_TOP_P = 0.9`, both overridable via `OLLAMA_TEMPERATURE`/
+`OLLAMA_TOP_P` following the exact `OLLAMA_TIMEOUT`/`timeout_from_env()` tolerant-fallback pattern).
+Previously unset, so Ollama fell back to qwen2.5-coder's own Modelfile default (0.7-0.8 range) —
+tuned for open-ended chat, not for reliably emitting well-formed tool-call JSON turn after turn. Not
+0.0: a small amount of variance still helps the model recover after a rejected/failed call instead
+of deterministically repeating the exact same (wrong) attempt (this is a *different* mechanism from
+the repetition-detection guard in "Reliability and failure recovery (Phase 8)" above — that one
+forcibly stops an identical repeated call; this is about not making that outcome the deterministic
+default in the first place). Deliberately did NOT add a `num_predict` cap despite the spec's general
+"avoid unnecessarily high max tokens" guidance — a low cap risks truncating a legitimate
+`write_file` call's `content` argument mid-generation (e.g. a file with several functions in it),
+which would corrupt the tool-call JSON entirely and produce a strictly worse failure than the
+verbosity this would have saved.
+
+**`run_command`'s output compression is scoped to large, fully-passing test runs only.**
+`tools/terminal.py`'s `_compress_if_clean_test_run()` collapses stdout to just its final summary
+line ("124 passed in 3.20s") when: the command actually succeeded (`exit_code == 0` — a failure is
+never compressed, the model needs the real detail to fix it), stdout is over
+`TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS` (2000 chars), and a recognizable pytest/unittest-style
+summary line is found near the end with no "failed"/"error" in it (defense in depth on top of the
+exit-code check, mirroring the same regex-based summary extraction `context_manager.py`'s
+`_summarize_command_outcome` already used for `TaskState`, but applied here to the actual
+model-facing tool output rather than only the compact task-memory record). Runs before, not instead
+of, the pre-existing `MAX_STDOUT_CHARS`/`MAX_STDERR_CHARS` truncation in `execute_command` — a
+genuinely huge stdout still gets truncated first, so the summary-line regex has real content to find
+rather than being cut off mid-match (a real bug caught during this phase's own testing: constructing
+test fixtures large enough to exceed `MAX_STDOUT_CHARS` before the summary line was reached made the
+line itself get truncated away, taken as a lesson to size test fixtures under that limit instead of
+raising it).

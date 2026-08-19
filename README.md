@@ -1,13 +1,23 @@
-# code-agent (Phase 9)
+# code-agent (Phase 10)
 
 A local, free, Claude Code–style coding assistant that runs entirely on your own
 machine using [Ollama](https://ollama.com) and `qwen2.5-coder:3b`. No cloud API,
 no API key, no subscription.
 
-This is **Phase 9**: context, performance, and Qwen 3B optimization — no
-major new features (per this phase's own scope rules). A careful read of
-Phases 1–8's existing code found that most of the obvious wins (capping
-tool outputs, compacting old conversation, bounded task memory) were
+This is **Phase 10**: autonomous filesystem operations and tool-calling reliability.
+The agent can now `delete_file`/`rename_file` a file directly (still approval-gated,
+still never through a shell — `rm`/`mv` remain denylisted in `run_command`), it
+detects and corrects a model response that describes a change instead of actually
+calling the tool for it (instead of silently accepting narration as a finished
+answer), the "unchanged since you last read it" cache-hit message was redesigned
+after live evidence it was itself causing the agent to stop mid-task, and Ollama's
+generation temperature/top_p are now tuned for reliable tool-call formatting instead
+of left at the model's own chat-tuned default. See "Phase 10: Autonomous Filesystem
+Operations & Tool-Calling Reliability" below for the full picture.
+
+Phase 9 (still fully in effect): context, performance, and Qwen 3B optimization — a
+careful read of Phases 1–8's existing code found that most of the obvious wins
+(capping tool outputs, compacting old conversation, bounded task memory) were
 **already built**; Phase 9 closed the real, verified gaps instead of
 rebuilding what was already there: an unchanged file is no longer resent
 in full on a second read within the same task, tool output caps now cover
@@ -40,8 +50,7 @@ Tool failure -> Application crashes
 ```
 
 See "Reliability and Failure Recovery" below for the full picture, and
-"What is NOT implemented yet" for what's still out of scope (unchanged from
-Phase 7 — this phase added no new capabilities on purpose).
+"What is NOT implemented yet" for what's still out of scope as of Phase 10.
 
 Phase 7 made the same agent reachable from inside VS Code, through a small
 local HTTP server (`code-agent serve`) and a VS Code extension
@@ -154,12 +163,15 @@ same ones.
 | `OLLAMA_MODEL`                  | `qwen2.5-coder:3b`       | Which Ollama model to chat with                          |
 | `OLLAMA_HOST`                   | `http://localhost:11434` | Base URL of the Ollama server                             |
 | `OLLAMA_TIMEOUT`                | `120` (seconds)           | How long to wait for a single Ollama response before treating it as failed and retrying. Raise this if you're on slower hardware or a larger model (e.g. 7B) and see repeated "Connection to Ollama failed... Retrying" messages that a real `ollama ps` shows was still actively generating. |
+| `OLLAMA_KEEP_ALIVE`             | `30m`                     | How long Ollama keeps the model loaded in memory after each response. Ollama's own server default is `5m`, short enough that a normal pause between agent turns can let the model fall out of memory, so the next message pays a multi-second-to-tens-of-seconds reload — which is what the "Connection to Ollama failed... Retrying" messages above are usually actually caused by, not a real connection problem. Set to `-1` to never unload. `code-agent` also explicitly pre-loads the model at startup (a "Loading model into memory..." spinner) so the very first message doesn't pay that cost either. |
+| `OLLAMA_TEMPERATURE`            | `0.2`                     | Sampling temperature sent to Ollama. Lower is more deterministic, which measurably helps a small model format tool-call JSON consistently instead of narrating (see "Phase 10" below). Raise it if you want more varied phrasing in plain-chat answers and don't mind a bit more tool-calling drift. |
+| `OLLAMA_TOP_P`                  | `0.9`                     | Nucleus-sampling top-p sent to Ollama, paired with the lowered temperature above. |
 | `CODE_AGENT_MAX_CONTEXT_CHARS`  | `12000` (chars)           | The whole-conversation character budget `compact_messages()` trims old tool output down to before it's sent to Ollama (see "Phase 9" below). Lower it on tighter memory, raise it if you have RAM to spare and want the model to keep more history verbatim. |
 
 Example:
 
 ```bash
-OLLAMA_MODEL=qwen2.5-coder:3b OLLAMA_HOST=http://localhost:11434 OLLAMA_TIMEOUT=240 code-agent
+OLLAMA_MODEL=qwen2.5-coder:3b OLLAMA_HOST=http://localhost:11434 OLLAMA_TIMEOUT=240 OLLAMA_KEEP_ALIVE=1h code-agent
 ```
 
 ## Example usage
@@ -311,6 +323,21 @@ Approval-gated editing (see "Safe file editing" below):
   unambiguous block of text in an existing file.
 - **`write_file(path, content)`** — proposes creating a brand-new file; fails
   if the file already exists.
+- **`delete_file(path)`** — proposes deleting one existing file. Files only —
+  no directory delete. Fails on the project root itself, a directory, or a
+  sensitive-pattern path. *(New in Phase 10.)*
+- **`rename_file(source, destination)`** — proposes renaming or moving one
+  existing file to a new path (moving into a different directory works the
+  same way — there's no separate move tool). Fails if the destination
+  already exists (delete it first if you mean to replace it), or if either
+  path is a directory or matches a sensitive pattern. *(New in Phase 10.)*
+
+Neither `delete_file` nor `rename_file` is a `run_command` allowlist entry —
+`rm`/`mv` remain explicitly denylisted (see "Safe command execution" below).
+They're first-class, validated tools instead, for the same reason every
+other mutation in this app is: better path-safety checks, clearer errors,
+and (for rename) automatic parent-directory creation and stale-proposal
+re-checking at apply time, none of which a bare shell command gives you.
 
 Approval-gated command execution (see "Safe command execution" below):
 
@@ -1198,14 +1225,18 @@ prompting/fine-tuning, per this phase's own explicit scope.
 
 ## Security
 
-The agent still cannot: delete files; read or write files outside the
-project root; or read/create/edit key/credential-shaped files
-(`*.pem`, `*.key`, `id_rsa*`, `credentials*.json`, `secrets.*`, `*.sqlite3`)
-even inside the root. `.env`/`.env.*` is a deliberate, later exception to
-that list (by request) — the agent can create/edit it directly like any
-other file, but staging one into Git still requires an explicit
-warning-and-override (see "Git integration"), independently of the edit
-permission. It cannot write *any* file, run *any* command, or
+As of Phase 10, the agent *can* delete or rename/move a single file — always
+through the approval-gated `delete_file`/`rename_file` tools, never through
+`run_command` (`rm`/`mv` remain explicitly denylisted there) and never for a
+directory or its contents. It still cannot: read or write files outside the
+project root; delete or rename a directory; or read/create/edit key/credential-shaped
+files (`*.pem`, `*.key`, `id_rsa*`, `credentials*.json`, `secrets.*`, `*.sqlite3`)
+even inside the root — `delete_file`/`rename_file` check the same
+sensitive-pattern list `edit_file`/`write_file` already did. `.env`/`.env.*` is a
+deliberate, later exception to that list (by request) — the agent can create/edit
+it directly like any other file, but staging one into Git still requires an
+explicit warning-and-override (see "Git integration"), independently of the edit
+permission. It cannot write, delete, or rename *any* file, run *any* command, or
 change *any* Git state, anywhere, without a human explicitly approving it
 first — the model only ever proposes. Approved commands are restricted to a
 small allowlist with no shell, no network access, no installers, and no
@@ -1448,7 +1479,9 @@ Everything from Phases 1–5, plus:
 
 ## What is NOT implemented (out of scope)
 
-- Deleting files (`delete_file`)
+- Deleting or renaming/moving a *directory* and its contents — `delete_file`/
+  `rename_file` (Phase 10) are file-only, by design; there is no recursive
+  or multi-file filesystem tool
 - Any GitHub/GitLab/remote-repository *integration* (PRs, issues, CI,
   hosted API calls), cloud execution, or remote agents. (`git_push` — a
   single, narrow, non-force push of the current branch to an

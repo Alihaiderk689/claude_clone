@@ -84,7 +84,13 @@ def _edit_file(
     if project.is_sensitive(target):
         raise PermissionDeniedError(f"Refusing to edit '{args.path}': it matches a sensitive-file pattern.")
     if not args.old_text:
-        raise ToolError("old_text must not be empty.")
+        raise ToolError(
+            "old_text must not be empty. edit_file replaces one exact existing block of text -- it "
+            "cannot insert/append/rewrite a file with no anchor. If you haven't called read_file on "
+            "this path yet in this conversation, do that first and choose a real block of its "
+            "existing content as old_text. If you actually mean to replace the file's entire "
+            "content, delete_file it first, then write_file the new content."
+        )
     if args.old_text == args.new_text:
         raise ToolError("old_text and new_text are identical; there's nothing to change.")
 

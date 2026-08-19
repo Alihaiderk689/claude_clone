@@ -77,6 +77,11 @@ def record_file_modified(task_state: Optional[TaskState], path: str) -> None:
         task_state.note_file_modified(path)
 
 
+def record_file_removed(task_state: Optional[TaskState], path: str) -> None:
+    if task_state is not None and path:
+        task_state.note_file_removed(path)
+
+
 def _looks_like_test_command(cmd: ApprovedCommand) -> bool:
     if cmd.program == "pytest":
         return True
@@ -232,10 +237,10 @@ def compact_messages(
     stats = CompactionStats()
     last_read_index: Dict[str, int] = {}
     for i, name, args, msg in _iter_tool_messages_with_args(messages):
-        path = args.get("path")
-        if not path:
-            continue
         if name == "read_file":
+            path = args.get("path")
+            if not path:
+                continue
             is_cache_hit_stub = bool(msg.get("cache_hit"))
             if path in last_read_index and not is_cache_hit_stub:
                 if _replace_if_not_already_placeholder(
@@ -244,13 +249,26 @@ def compact_messages(
                     stats.superseded += 1
             if not is_cache_hit_stub:
                 last_read_index[path] = i
-        elif name in ("edit_file", "write_file"):
-            if path in last_read_index:
+        elif name in ("edit_file", "write_file", "delete_file"):
+            path = args.get("path")
+            if path and path in last_read_index:
                 if _replace_if_not_already_placeholder(
                     messages[last_read_index[path]], _STALE_PLACEHOLDER.format(path=path)
                 ):
                     stats.stale += 1
                 del last_read_index[path]
+        elif name == "rename_file":
+            # rename_file's args are source/destination, not path -- only the
+            # earlier read of the SOURCE path is now stale (it no longer
+            # exists there); the destination was never read under its new
+            # name, so there's nothing to invalidate for it.
+            source = args.get("source")
+            if source and source in last_read_index:
+                if _replace_if_not_already_placeholder(
+                    messages[last_read_index[source]], _STALE_PLACEHOLDER.format(path=source)
+                ):
+                    stats.stale += 1
+                del last_read_index[source]
 
     tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     protected = set(tool_indices[-keep_recent:]) if keep_recent else set()

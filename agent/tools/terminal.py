@@ -12,6 +12,7 @@ model's own say-so, and never unrestricted shell access.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -34,6 +35,13 @@ from .base import Tool, ToolError, ToolResult
 
 MAX_STDOUT_CHARS = 12000
 MAX_STDERR_CHARS = 12000
+
+# Below this, stdout is left exactly as-is even if it's a passing test run --
+# not worth adding a second code path for output that was already small.
+TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS = 2000
+_TEST_SUMMARY_LINE_RE = re.compile(
+    r"\d+\s+(?:passed|failed|error|errors|skipped)[\w\s,.]*", re.IGNORECASE
+)
 
 # How often the wait loop below wakes up to check the timeout and
 # cancel_event -- small enough that Stop Task feels responsive, large
@@ -232,6 +240,34 @@ def execute_command(
     )
 
 
+def _compress_if_clean_test_run(stdout: str, exit_code: Optional[int]) -> str:
+    """Collapse a large, fully-passing test run's stdout down to just its
+    final summary line ("124 passed in 3.2s") instead of resending every
+    individual PASSED line to the model. Only applies when: stdout is big
+    enough to matter, the command actually succeeded (exit_code == 0 --
+    never compress a failure, the model needs the real detail to fix it),
+    and a recognizable pytest/unittest-style summary line is present near
+    the end with no "failed"/"error" in it (defense in depth on top of the
+    exit-code check -- some runners still exit 0 with partial failures
+    reported in text). Returns `stdout` unchanged otherwise.
+    """
+    if exit_code != 0 or len(stdout) < TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS:
+        return stdout
+    match = None
+    for match in _TEST_SUMMARY_LINE_RE.finditer(stdout[-500:]):
+        pass  # keep the last match -- the real summary is at the end
+    if not match:
+        return stdout
+    summary = match.group(0).strip()
+    if "fail" in summary.lower() or "error" in summary.lower():
+        return stdout
+    omitted = len(stdout) - len(summary)
+    return (
+        f"{summary}\n[{omitted:,} characters of passing test output omitted -- "
+        "all tests passed, nothing failed to show detail for]"
+    )
+
+
 def format_result_for_model(result: CommandExecutionResult) -> str:
     header = f"$ {result.program} {' '.join(result.args)}".rstrip()
     if result.cancelled:
@@ -240,12 +276,13 @@ def format_result_for_model(result: CommandExecutionResult) -> str:
         status = "TIMED OUT (no exit code; process was terminated)"
     else:
         status = f"exit code: {result.exit_code}"
+    stdout = _compress_if_clean_test_run(result.stdout, result.exit_code)
     parts = [header, status]
-    if result.stdout:
-        parts.append(f"--- stdout ---\n{result.stdout}")
+    if stdout:
+        parts.append(f"--- stdout ---\n{stdout}")
     if result.stderr:
         parts.append(f"--- stderr ---\n{result.stderr}")
-    if not result.stdout and not result.stderr:
+    if not stdout and not result.stderr:
         parts.append("(no output)")
     return "\n".join(parts)
 

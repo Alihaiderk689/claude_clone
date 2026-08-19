@@ -7,6 +7,7 @@ from ..project import ProjectRoot
 from ..task_state import TaskState
 from .base import Tool, ToolError, ToolResult
 from .editing import apply_change, build_edit_file_tool, build_write_file_tool
+from .file_ops import apply_file_op, build_delete_file_tool, build_rename_file_tool
 from .filesystem import build_list_files_tool, build_read_file_tool
 from .git import (
     apply_git_operation,
@@ -57,6 +58,8 @@ def build_default_registry(
     registry.register(build_search_files_tool(project))
     registry.register(build_edit_file_tool(project, tracker))
     registry.register(build_write_file_tool(project, tracker))
+    registry.register(build_delete_file_tool(project))
+    registry.register(build_rename_file_tool(project))
     registry.register(build_run_command_tool(project))
     registry.register(build_git_status_tool(project))
     registry.register(build_git_diff_tool(project))
@@ -79,6 +82,7 @@ __all__ = [
     "FileStateTracker",
     "TaskState",
     "apply_change",
+    "apply_file_op",
     "apply_git_operation",
     "execute_command",
     "build_default_registry",

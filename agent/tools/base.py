@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..command_policy import ApprovedCommand
 from ..diff import ProposedChange
+from ..file_ops import ProposedFileOp
 from ..git_policy import ProposedGitOperation
 from ..planner import Plan
 
@@ -119,6 +120,13 @@ class ToolResult:
     # approve on a bare Enter (a plan has no side effects of its own; approving
     # it is not permission to skip file/command/Git approvals).
     pending_plan: Optional[Plan] = None
+    # Set only by delete_file/rename_file on success: a validated, not-yet-applied
+    # filesystem mutation (delete or rename/move). The agent loop must pause for
+    # user approval before anything happens on disk -- see tools/file_ops.py's
+    # apply_file_op() and loop.py's "confirm_file_op" event. Same propose/apply
+    # split as pending_change; kept as its own field (not folded into
+    # pending_change) because a delete/rename has no textual diff to show.
+    pending_file_op: Optional[ProposedFileOp] = None
     # Phase 9: set only by read_file, only on success, when it short-circuited
     # a redundant full read of an unchanged file instead of resending the
     # whole file again -- see tools/filesystem.py's _read_file. None for

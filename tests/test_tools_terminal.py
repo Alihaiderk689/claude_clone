@@ -19,6 +19,7 @@ from agent.project import ProjectRoot
 from agent.tools.terminal import (
     MAX_STDERR_CHARS,
     MAX_STDOUT_CHARS,
+    TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS,
     build_run_command_tool,
     execute_command,
     format_result_for_model,
@@ -311,6 +312,52 @@ class TestFormatResultForModel:
         assert "exit code: 1" in text
         assert "1 failed" in text
         assert "warning" in text
+
+    def test_large_clean_test_run_is_compressed_to_summary(self, tmp_path):
+        # Stays under execute_command's own MAX_STDOUT_CHARS truncation (so
+        # the real final summary line survives to reach format_result_for_model)
+        # while still comfortably over TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS.
+        cmd = ApprovedCommand(program="pytest", args=["-v"], timeout=120, cwd=tmp_path)
+        passing_lines = "\n".join(f"t{i} PASSED" for i in range(300))
+        huge_stdout = f"{passing_lines}\n124 passed in 3.20s\n"
+        assert TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS < len(huge_stdout) < MAX_STDOUT_CHARS
+        fake = _fake_proc(returncode=0, stdout=huge_stdout, stderr="")
+        with mock.patch("agent.tools.terminal.subprocess.Popen", return_value=fake):
+            result = execute_command(cmd)
+
+        text = format_result_for_model(result)
+
+        assert "124 passed in 3.20s" in text
+        assert "characters of passing test output omitted" in text
+        assert "t0 PASSED" not in text  # the individual lines are gone
+        assert "exit code: 0" in text
+
+    def test_large_failing_test_run_is_never_compressed(self, tmp_path):
+        cmd = ApprovedCommand(program="pytest", args=["-v"], timeout=120, cwd=tmp_path)
+        lines = "\n".join(f"t{i} PASSED" for i in range(300))
+        huge_stdout = f"{lines}\nt299 FAILED\n123 passed, 1 failed in 3.20s\n"
+        assert TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS < len(huge_stdout) < MAX_STDOUT_CHARS
+        fake = _fake_proc(returncode=1, stdout=huge_stdout, stderr="")
+        with mock.patch("agent.tools.terminal.subprocess.Popen", return_value=fake):
+            result = execute_command(cmd)
+
+        text = format_result_for_model(result)
+
+        assert "t0 PASSED" in text  # full detail preserved -- exit code != 0
+        assert "characters of passing test output omitted" not in text
+
+    def test_small_clean_test_run_is_left_alone(self, tmp_path):
+        """Below TEST_OUTPUT_COMPRESSION_THRESHOLD_CHARS, compression isn't
+        worth a second code path -- the small output is shown as-is."""
+        cmd = ApprovedCommand(program="pytest", args=["-v"], timeout=120, cwd=tmp_path)
+        fake = _fake_proc(returncode=0, stdout="2 passed in 0.01s\n", stderr="")
+        with mock.patch("agent.tools.terminal.subprocess.Popen", return_value=fake):
+            result = execute_command(cmd)
+
+        text = format_result_for_model(result)
+
+        assert "2 passed in 0.01s" in text
+        assert "omitted" not in text
 
 
 class TestRealSubprocessTermination:

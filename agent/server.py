@@ -46,7 +46,15 @@ from . import context_budget
 from .cli import _fresh_session_state
 from .loop import run_agent_turn
 from .logging_config import get_logger
-from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient, timeout_from_env
+from .ollama_client import (
+    DEFAULT_HOST,
+    DEFAULT_MODEL,
+    OllamaClient,
+    keep_alive_from_env,
+    temperature_from_env,
+    timeout_from_env,
+    top_p_from_env,
+)
 from .project import ProjectRoot
 from .tools.state import FileStateTracker
 from .task_state import TaskState
@@ -61,7 +69,9 @@ DEFAULT_PORT = 8765
 TOKEN_DIR = Path.home() / ".code-agent"
 TOKEN_FILE = TOKEN_DIR / "server.json"
 
-CONFIRM_EVENT_TYPES = {"confirm", "confirm_command", "confirm_git_operation", "confirm_plan"}
+CONFIRM_EVENT_TYPES = {
+    "confirm", "confirm_file_op", "confirm_command", "confirm_git_operation", "confirm_plan",
+}
 
 VALID_MODES = {"manual", "auto"}
 
@@ -558,7 +568,14 @@ def build_server(port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
     """
     host = os.environ.get("OLLAMA_HOST", DEFAULT_HOST)
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
-    client = OllamaClient(host=host, model=model, timeout=timeout_from_env())
+    client = OllamaClient(
+        host=host,
+        model=model,
+        timeout=timeout_from_env(),
+        keep_alive=keep_alive_from_env(),
+        temperature=temperature_from_env(),
+        top_p=top_p_from_env(),
+    )
 
     token = secrets.token_hex(32)
 

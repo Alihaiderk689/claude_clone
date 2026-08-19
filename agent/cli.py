@@ -19,10 +19,20 @@ from rich.panel import Panel
 from . import context_budget, context_manager
 from .command_policy import ApprovedCommand
 from .diff import ProposedChange, unified_diff_text
+from .file_ops import ProposedFileOp
 from .git_policy import ProposedGitOperation
 from .logging_config import configure_logging, debug_enabled_from_env, get_logger
 from .loop import MAX_TOOL_ITERATIONS, run_agent_turn
-from .ollama_client import DEFAULT_HOST, DEFAULT_MODEL, OllamaClient, timeout_from_env
+from .ollama_client import (
+    DEFAULT_HOST,
+    DEFAULT_MODEL,
+    OllamaClient,
+    OllamaError,
+    keep_alive_from_env,
+    temperature_from_env,
+    timeout_from_env,
+    top_p_from_env,
+)
 from .planner import Plan
 from .project import ProjectRoot
 from .task_state import TaskState
@@ -34,20 +44,30 @@ SYSTEM_PROMPT_TEMPLATE = """You are a coding assistant operating inside a specif
 {project_root}
 
 You have read-only inspection tools (list_files, read_file, search_files, git_status, git_diff, \
-git_log), controlled editing tools (edit_file, write_file), one controlled command-execution tool \
-(run_command), and controlled Git modification tools (git_create_branch, git_stage, git_commit). \
-Use inspection tools only for questions that actually require looking at this project's files, \
-structure, or Git history — never guess about file names, code, or behavior you have not actually \
-inspected.
+git_log), controlled editing tools (edit_file, write_file), controlled filesystem-mutation tools \
+(delete_file, rename_file), one controlled command-execution tool (run_command), and controlled \
+Git modification tools (git_create_branch, git_stage, git_commit, git_push). Use inspection tools \
+only for questions that actually require looking at this project's files, structure, or Git \
+history — never guess about file names, code, or behavior you have not actually inspected.
 
-Pick the narrowest tool for what you actually need: need to find a file or a symbol without \
-knowing exactly where it is → search_files; need a directory's structure → list_files; need a \
-specific file's contents once you know its path → read_file; need to modify an existing file → \
-edit_file; need to create a new file → write_file; need to run a test/lint/build command → \
-run_command; need Git state → git_status/git_diff/git_log. Don't read_file every file in a \
-directory to find something — search_files first, then read only what's actually relevant. \
-Don't re-read a file you already have unchanged content for in this conversation (read_file will \
-tell you when that's happened).
+Pick the narrowest tool for what you actually need, and infer it yourself from what the user \
+asked — never ask the user which tool to use or tell them what you would call: need to find a \
+file or a symbol without knowing exactly where it is → search_files; need a directory's structure \
+→ list_files; need a specific file's contents once you know its path → read_file; need to modify \
+an existing file → edit_file; need to create a new file → write_file; need to remove/delete an \
+obsolete file → delete_file; need to rename or move a file → rename_file; need to run a test/lint/\
+build command → run_command; need Git state → git_status/git_diff/git_log. For example: "remove \
+old.py" → delete_file("old.py"); "rename app_old.py to app.py" → rename_file("app_old.py", \
+"app.py"); "move utils.py into lib/" → rename_file("utils.py", "lib/utils.py"); "create utils.py \
+with these functions" → write_file("utils.py", ...); "fix the bug in auth.py" → \
+read_file("auth.py") then edit_file(...) then, if tests exist, run_command(...). A request that \
+combines several of these ("rename X to Y and update the imports that reference it") means \
+working through all of them in this same turn, in order, without stopping to ask permission \
+between steps beyond each tool's own approval prompt — see the "multi-step requests" note below. \
+Don't read_file every file in a directory to find something — search_files first, then read only \
+what's actually relevant. Don't re-read a file you already have unchanged content for in this \
+conversation (read_file will tell you when that's happened, and the content is still valid — \
+continue the task with it instead of re-reading or stopping to ask what's next).
 
 For general programming questions that have nothing to do with this specific project (language \
 features, concepts, debugging advice, writing a standalone example, etc.), answer directly from \
@@ -63,23 +83,34 @@ actually read in this conversation.
 include enough surrounding context to make the match unambiguous). Use write_file only for files \
 that don't exist yet; it fails if the file is already there.
 
-When you decide to make a change, call edit_file or write_file immediately — never describe the \
-change, paste the new file content, or show a diff as plain chat text and then ask whether to \
-proceed. Printing code or a diff in your reply does nothing: only an actual edit_file/write_file \
-tool call proposes something the user can approve. This applies just as much once the user has \
-already told you to go ahead — if they reply "yes", "proceed", "go ahead", or similar after you \
+When you decide to make a change, call edit_file, write_file, delete_file, or rename_file \
+immediately — never describe the change, paste the new file content, or show a diff as plain chat \
+text and then ask whether to proceed. Printing code or a diff in your reply does nothing: only an \
+actual tool call proposes something the user can approve. This applies just as much once the user \
+has already told you to go ahead — if they reply "yes", "proceed", "go ahead", or similar after you \
 described a plan, your very next output must be the tool call itself, not another description of \
-what you're about to do.
+what you're about to do. It also applies to the request itself the first time: if what the user \
+asked for is already unambiguous (they named the file and the change), call the tool immediately — \
+do not restate their request back to them as a question or ask them to confirm something they \
+already told you clearly.
 
-Every edit_file and write_file call only proposes a change — it is never applied automatically. \
-The user is shown a diff and must explicitly approve it before anything is written to disk. \
-Because of this:
-- Never claim a file was modified, created, or fixed until the tool result confirms the user \
-approved it and the write succeeded. A pending or rejected proposal is not a completed change.
+Every edit_file, write_file, delete_file, and rename_file call only proposes a change — it is \
+never applied automatically. The user is shown what would happen (a diff for edit/write, the path \
+for delete, source → destination for rename) and must explicitly approve it before anything \
+happens on disk. Because of this:
+- Never claim a file was modified, created, deleted, renamed, or moved until the tool result \
+confirms the user approved it and it succeeded. A pending or rejected proposal is not a completed \
+change.
 - If the user rejects a change, do not immediately re-propose the same edit — acknowledge the \
 rejection and ask what they'd like instead, or wait for further instructions.
 - If a tool reports the target text wasn't found, appeared more than once, or the file changed \
 since it was last read, don't guess — read_file again and propose a more precise edit.
+- rename_file fails if the destination already exists — if the user wants to replace one file with \
+another, delete_file the old one first (after it's approved), then rename_file, rather than \
+guessing at a different approach.
+- There is no directory delete/rename and no generic filesystem-move-many-files tool — if a \
+request genuinely needs one, say so plainly rather than trying to fake it with several single-file \
+calls that don't actually cover it.
 
 run_command runs one local development/test command at a time (e.g. pytest, ruff check ., mypy ., \
 npm test, npm run <script>, python -m pytest, or python manage.py test) and, like editing, only \
@@ -135,6 +166,20 @@ working on it and completed only once it is genuinely done — verified (e.g. te
 just edited — using update_plan; use blocked or failed with a short note if you cannot continue a \
 step rather than claiming success. A plan is not permission to skip approvals: every file edit, \
 command, and Git operation still needs its own separate approval exactly as before.
+
+Multi-step requests (e.g. "rename bubble_sort.py to sorting.py, add quick_sort and merge_sort, \
+update the imports that reference it, and run the tests") are completed end-to-end in this same \
+turn, tool call after tool call, without waiting for a new message from the user between steps — \
+each individual tool call still gets its own approval prompt exactly as described above, but you \
+are the one deciding the next step and calling the next tool, not stopping to ask the user what \
+that next step should be. Only stop and ask the user something when you're genuinely blocked on \
+information only they can provide (which of two ambiguous things they meant, a choice with a real \
+tradeoff) or the tool results show a real blocking error you can't work around — not merely because \
+a step finished, because a read_file result came back as unchanged/cached, or because you're not \
+sure the user is still watching. If you run a test/verification command as part of a request and \
+it fails, read the failure, fix it, and re-run the same (or a more targeted) check yourself rather \
+than reporting the failure and stopping — unless you've tried a genuinely different fix more than \
+once or twice without success, in which case explain what's failing and why you're stuck.
 
 Never claim to have inspected a file or directory you have not actually called a tool on. If a \
 tool call fails or turns up nothing useful, say so instead of making something up."""
@@ -199,6 +244,36 @@ def _ask_approval(console: Console) -> str:
 
 def _handle_confirm(console: Console, change: ProposedChange, turn_state: dict) -> bool:
     render_diff(console, change)
+    if turn_state["approve_all"]:
+        console.print("[dim](auto-approved — \"approve all\" is active for this turn)[/dim]")
+        return True
+
+    action = _ask_approval(console)
+    if action == "all":
+        turn_state["approve_all"] = True
+        return True
+    return action == "yes"
+
+
+def render_file_op(console: Console, op: ProposedFileOp) -> None:
+    """Print what a proposed delete/rename would do. No diff to show (unlike
+    render_diff) -- delete/rename don't change file content, just paths."""
+    if op.kind == "delete":
+        console.print(f"\n[bold]Delete file:[/bold] {escape(op.source_path)}")
+    else:
+        console.print(
+            f"\n[bold]Rename file:[/bold] {escape(op.source_path)} "
+            f"[dim]->[/dim] {escape(op.destination_path or '')}"
+        )
+
+
+def _handle_file_op_confirm(console: Console, op: ProposedFileOp, turn_state: dict) -> bool:
+    """Shares turn_state["approve_all"] with _handle_confirm (edit_file/
+    write_file) -- delete/rename are the same risk class as an edit (a
+    reversible filesystem mutation, no command execution, no Git state
+    change), so approving "all" from either prompt covers both kinds for
+    the rest of this turn, matching auto_approve_edits' scope in loop.py."""
+    render_file_op(console, op)
     if turn_state["approve_all"]:
         console.print("[dim](auto-approved — \"approve all\" is active for this turn)[/dim]")
         return True
@@ -437,6 +512,42 @@ def render_turn(
             elif etype == "change_rejected":
                 console.print("[yellow]✗ Change rejected. No files were modified.[/yellow]\n")
 
+            elif etype == "confirm_file_op":
+                status.stop()
+                if not inspecting_announced:
+                    console.print("[dim]Agent is inspecting the project...[/dim]\n")
+                    inspecting_announced = True
+                op = event["operation"]
+                if event.get("auto_approved"):
+                    label = (
+                        f"delete: {op.source_path}"
+                        if op.kind == "delete"
+                        else f"rename: {op.source_path} -> {op.destination_path}"
+                    )
+                    console.print(f"[dim]✓ Auto-approved {escape(label)}[/dim]")
+                else:
+                    send_value = _handle_file_op_confirm(console, op, turn_state)
+                status.start()
+
+            elif etype == "file_op_applied":
+                op = event["operation"]
+                if op.kind == "delete":
+                    console.print(f"[green]✓ Deleted successfully.[/green] ({escape(op.source_path)})\n")
+                else:
+                    console.print(
+                        f"[green]✓ Renamed successfully.[/green] "
+                        f"({escape(op.source_path)} -> {escape(op.destination_path or '')})\n"
+                    )
+
+            elif etype == "file_op_rejected":
+                console.print("[yellow]✗ File operation rejected. Nothing was changed.[/yellow]\n")
+
+            elif etype == "narration_redirected":
+                console.print(
+                    "[dim]Agent described the change without performing it -- continuing "
+                    f"automatically ({event['attempt']}/{event['max_attempts']})...[/dim]"
+                )
+
             elif etype == "confirm_command":
                 status.stop()
                 if not inspecting_announced:
@@ -501,6 +612,12 @@ def render_turn(
                     console.print("[bold cyan]Agent[/bold cyan] > ", end="")
                     console.print(event["text"], end="", highlight=False, soft_wrap=True, markup=False)
                 console.print()
+                if event.get("task_incomplete"):
+                    console.print(
+                        "[yellow]⚠ This may not be fully done -- the agent described an action "
+                        "without a tool call actually performing it. Check the result, or ask again "
+                        "more specifically.[/yellow]"
+                    )
                 console.print()
 
             elif etype == "retry":
@@ -589,7 +706,14 @@ def main() -> None:
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL)
     project_root_path = Path.cwd().resolve()
 
-    client = OllamaClient(host=host, model=model, timeout=timeout_from_env())
+    client = OllamaClient(
+        host=host,
+        model=model,
+        timeout=timeout_from_env(),
+        keep_alive=keep_alive_from_env(),
+        temperature=temperature_from_env(),
+        top_p=top_p_from_env(),
+    )
     project = ProjectRoot(project_root_path)
     tracker, task_state, registry, messages = _fresh_session_state(project, project_root_path)
     mode = "manual"  # toggled with /auto and /manual; survives /new, resets on process restart
@@ -604,6 +728,17 @@ def main() -> None:
             f"running at [cyan]{escape(host)}[/cyan] (start it with: [cyan]ollama serve[/cyan])."
         )
         sys.exit(1)
+
+    with console.status(
+        "[dim]Loading model into memory (first use can take a while)...[/dim]", spinner="dots"
+    ):
+        try:
+            client.warm_up()
+        except OllamaError as exc:
+            console.print(
+                f"[yellow]Could not pre-load the model ({escape(str(exc))}); "
+                "the first message below may be slower than usual.[/yellow]\n"
+            )
 
     while True:
         try:
@@ -630,8 +765,8 @@ def main() -> None:
         if user_input.lower() in AUTO_MODE_COMMANDS:
             mode = "auto"
             console.print(
-                "[dim]Auto mode on: file edits and plans apply without asking. Commands and Git "
-                "operations still ask every time. Switch back with /manual.[/dim]\n"
+                "[dim]Auto mode on: file edits, deletes, renames, and plans apply without asking. "
+                "Commands and Git operations still ask every time. Switch back with /manual.[/dim]\n"
             )
             continue
 

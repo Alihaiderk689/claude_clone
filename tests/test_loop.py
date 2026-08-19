@@ -26,7 +26,9 @@ def updates(*items):
         yield {"content": content, "tool_calls": tool_calls, "done": done}
 
 
-_CONFIRMATION_EVENT_TYPES = {"confirm", "confirm_command", "confirm_git_operation", "confirm_plan"}
+_CONFIRMATION_EVENT_TYPES = {
+    "confirm", "confirm_file_op", "confirm_command", "confirm_git_operation", "confirm_plan",
+}
 
 
 def drive_agent_turn(gen, decisions=()):
@@ -177,12 +179,12 @@ class TestToolCallThenFinalAnswer:
     def test_unknown_tool_produces_tool_error_but_continues(self, registry):
         client = mock.create_autospec(OllamaClient, instance=True)
         first_call = updates(
-            ("", [{"function": {"name": "delete_file", "arguments": {"path": "x"}}}], True),
+            ("", [{"function": {"name": "totally_unknown_tool", "arguments": {"path": "x"}}}], True),
         )
         second_call = updates(("I can't do that yet.", None, True))
         client.chat.side_effect = [first_call, second_call]
 
-        messages = [{"role": "user", "content": "delete a file"}]
+        messages = [{"role": "user", "content": "do something unsupported"}]
         events = list(run_agent_turn(client, registry, messages))
 
         tool_error_events = [e for e in events if e["type"] == "tool_error"]
@@ -216,7 +218,7 @@ class TestReadFileCacheIntegration:
         assert len(tool_messages) == 2
         assert "class JWTAuth" in tool_messages[0]["content"]
         assert tool_messages[0].get("cache_hit") is None
-        assert "unchanged since you last read it" in tool_messages[1]["content"]
+        assert "status=unchanged" in tool_messages[1]["content"]
         assert tool_messages[1].get("cache_hit") is True
 
         tool_call_events = [e for e in events if e["type"] == "tool_call"]
@@ -1625,3 +1627,380 @@ class TestRepetitionDetection:
         repetition_events = [e for e in events if e["type"] == "repetition_detected"]
         assert len(tool_error_events) == 2  # first 2 attempts genuinely fail validation
         assert len(repetition_events) == 1  # 3rd is intercepted instead of failing again
+
+
+class TestFileOpApprovalFlow:
+    """delete_file/rename_file follow the exact same propose/pause/apply
+    split as edit_file/write_file (TestApprovalFlow above) -- nothing on
+    disk changes until the caller sends back an explicit True."""
+
+    def test_approved_delete_removes_file(self, project, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "delete_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+        second_call = updates(("Deleted it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "remove auth.py"}]
+        gen = run_agent_turn(client, registry, messages)
+        events = drive_agent_turn(gen, decisions=[True])
+
+        confirm_events = [e for e in events if e["type"] == "confirm_file_op"]
+        applied_events = [e for e in events if e["type"] == "file_op_applied"]
+        assert len(confirm_events) == 1
+        assert confirm_events[0]["operation"].kind == "delete"
+        assert len(applied_events) == 1
+        assert not (project.root / "backend" / "auth.py").exists()
+
+    def test_rejected_delete_is_not_applied(self, project, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "delete_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+        second_call = updates(("Okay, leaving it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "remove auth.py"}]
+        gen = run_agent_turn(client, registry, messages)
+        events = drive_agent_turn(gen, decisions=[False])
+
+        assert any(e["type"] == "file_op_rejected" for e in events)
+        assert not any(e["type"] == "file_op_applied" for e in events)
+        assert (project.root / "backend" / "auth.py").exists()
+
+    def test_approved_rename_moves_file(self, project, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            (
+                "",
+                [
+                    {
+                        "function": {
+                            "name": "rename_file",
+                            "arguments": {"source": "backend/auth.py", "destination": "backend/security.py"},
+                        }
+                    }
+                ],
+                True,
+            ),
+        )
+        second_call = updates(("Renamed it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "rename auth.py to security.py"}]
+        gen = run_agent_turn(client, registry, messages)
+        events = drive_agent_turn(gen, decisions=[True])
+
+        assert any(e["type"] == "file_op_applied" for e in events)
+        assert not (project.root / "backend" / "auth.py").exists()
+        assert (project.root / "backend" / "security.py").exists()
+
+    def test_auto_approve_edits_also_covers_file_ops(self, project, registry):
+        """auto_approve_edits is documented to cover delete_file/rename_file
+        as the same risk class as edit_file/write_file -- verify the
+        generator resolves the approval internally with no decision sent."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "delete_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+        second_call = updates(("Deleted it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "remove auth.py"}]
+        events = list(run_agent_turn(client, registry, messages, auto_approve_edits=True))
+
+        confirm_events = [e for e in events if e["type"] == "confirm_file_op"]
+        assert confirm_events[0]["auto_approved"] is True
+        assert any(e["type"] == "file_op_applied" for e in events)
+        assert not (project.root / "backend" / "auth.py").exists()
+
+    def test_delete_updates_task_state(self, project, registry, task_state):
+        task_state.note_file_inspected("backend/auth.py")
+        client = mock.create_autospec(OllamaClient, instance=True)
+        first_call = updates(
+            ("", [{"function": {"name": "delete_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+        second_call = updates(("Deleted it.", None, True))
+        client.chat.side_effect = [first_call, second_call]
+
+        messages = [{"role": "user", "content": "remove auth.py"}]
+        gen = run_agent_turn(client, registry, messages, task_state=task_state)
+        drive_agent_turn(gen, decisions=[True])
+
+        assert "backend/auth.py" not in task_state.files_inspected
+
+
+class TestNarrationDetection:
+    """A model response with zero tool calls that reads as unactioned
+    narration ("I'll do X", "what would you like me to do next?") must not
+    be accepted as the final answer while no mutating tool has run yet this
+    turn -- see loop.py's _looks_like_unactioned_narration and
+    MUTATING_TOOL_NAMES. Reproduces the live-observed failure: two read_file
+    calls (including a cache hit), then plain-text narration with no tool
+    call at all."""
+
+    def test_deferral_question_with_no_tool_call_is_redirected(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = [
+            updates(("Got it! What would you like me to do next?", None, True)),
+            updates(("Done, I created the file.", None, True)),
+        ]
+
+        messages = [{"role": "user", "content": "create hello.py with a hello function"}]
+        events = list(run_agent_turn(client, registry, messages))
+
+        redirected = [e for e in events if e["type"] == "narration_redirected"]
+        final_events = [e for e in events if e["type"] == "final"]
+        assert len(redirected) == 1
+        assert redirected[0]["attempt"] == 1
+        assert len(final_events) == 1
+        assert final_events[0]["text"] == "Done, I created the file."
+        assert not final_events[0].get("task_incomplete")
+        assert client.chat.call_count == 2
+
+    def test_unactioned_intent_with_no_tool_call_is_redirected(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = [
+            updates(("Sure, I'll create hello.py with a hello function for you.", None, True)),
+            updates(
+                (
+                    "",
+                    [{"function": {"name": "write_file", "arguments": {"path": "hello.py", "content": "x = 1\n"}}}],
+                    True,
+                ),
+            ),
+            updates(("Created it.", None, True)),
+        ]
+
+        messages = [{"role": "user", "content": "create hello.py"}]
+        gen = run_agent_turn(client, registry, messages)
+        events = drive_agent_turn(gen, decisions=[True])
+
+        assert any(e["type"] == "narration_redirected" for e in events)
+        assert any(e["type"] == "change_applied" for e in events)
+
+    def test_a_mutating_tool_call_first_means_no_redirect_even_if_final_text_matches(self, registry, project):
+        """Once a mutating tool has actually run this turn, a later
+        plain-text wrap-up must NOT be treated as unactioned narration even
+        if it happens to contain similar phrasing -- it's a real completion
+        report, not a stall."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = [
+            updates(
+                (
+                    "",
+                    [
+                        {
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"path": "hello.py", "content": "x = 1\n"},
+                            }
+                        }
+                    ],
+                    True,
+                ),
+            ),
+            updates(("I created hello.py -- let me know if you would like anything else.", None, True)),
+        ]
+
+        messages = [{"role": "user", "content": "create hello.py"}]
+        gen = run_agent_turn(client, registry, messages)
+        events = drive_agent_turn(gen, decisions=[True])
+
+        assert not any(e["type"] == "narration_redirected" for e in events)
+        final_events = [e for e in events if e["type"] == "final"]
+        assert len(final_events) == 1
+
+    def test_repeated_narration_exhausts_retries_and_flags_task_incomplete(self, registry):
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = lambda *a, **k: updates(
+            ("I'll create hello.py for you shortly.", None, True),
+        )
+
+        messages = [{"role": "user", "content": "create hello.py"}]
+        events = list(run_agent_turn(client, registry, messages, max_iterations=10))
+
+        redirected = [e for e in events if e["type"] == "narration_redirected"]
+        final_events = [e for e in events if e["type"] == "final"]
+        assert len(redirected) == 2  # MAX_NARRATION_RETRIES
+        assert len(final_events) == 1
+        assert final_events[0]["task_incomplete"] is True
+
+    def test_genuine_informational_answer_is_not_flagged(self, registry):
+        """A real answer to a real question (no mutation implied) must not
+        be redirected just because it happens to share some phrasing."""
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.return_value = updates(
+            (
+                "A list comprehension in Python is a concise way to build a list, e.g. "
+                "[x * 2 for x in range(5)].",
+                None,
+                True,
+            ),
+        )
+
+        messages = [{"role": "user", "content": "what is a list comprehension?"}]
+        events = list(run_agent_turn(client, registry, messages))
+
+        assert not any(e["type"] == "narration_redirected" for e in events)
+        assert client.chat.call_count == 1
+
+
+class TestEndToEndSortingScenario:
+    """The representative end-to-end scenario this whole feature set was
+    built for: create a new combined file, migrate the old implementation
+    into it, update a reference to the old file, delete the old file, and
+    run the tests -- all in one turn, driven entirely by the model's own
+    tool calls with no human ever typing "call write_file now" or "call
+    delete_file" mid-task. Exercises write_file, search_files, edit_file,
+    delete_file, and run_command together against a real temp-dir project;
+    only OllamaClient.chat and the run_command subprocess are mocked."""
+
+    @pytest.fixture
+    def sorting_project(self, tmp_path):
+        (tmp_path / "bubble_sort.py").write_text(
+            "def bubble_sort(items):\n"
+            "    items = list(items)\n"
+            "    for i in range(len(items)):\n"
+            "        for j in range(len(items) - i - 1):\n"
+            "            if items[j] > items[j + 1]:\n"
+            "                items[j], items[j + 1] = items[j + 1], items[j]\n"
+            "    return items\n"
+        )
+        (tmp_path / "main.py").write_text(
+            "import bubble_sort\n\nprint(bubble_sort.bubble_sort([3, 1, 2]))\n"
+        )
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_sorting.py").write_text("def test_placeholder():\n    assert True\n")
+        return ProjectRoot(tmp_path)
+
+    @pytest.fixture
+    def sorting_task_state(self):
+        return TaskState()
+
+    @pytest.fixture
+    def sorting_registry(self, sorting_project, sorting_task_state):
+        return build_default_registry(sorting_project, task_state=sorting_task_state)
+
+    def test_full_scenario_completes_without_manual_intervention(
+        self, sorting_project, sorting_registry, sorting_task_state
+    ):
+        combined_content = (
+            "def bubble_sort(items):\n    return sorted(items)\n\n"
+            "def quick_sort(items):\n    return sorted(items)\n\n"
+            "def merge_sort(items):\n    return sorted(items)\n\n"
+            "def insertion_sort(items):\n    return sorted(items)\n\n"
+            "def selection_sort(items):\n    return sorted(items)\n"
+        )
+
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = [
+            updates(("", [{"function": {"name": "list_files", "arguments": {"path": "."}}}], True)),
+            updates(
+                ("", [{"function": {"name": "read_file", "arguments": {"path": "bubble_sort.py"}}}], True)
+            ),
+            updates(
+                (
+                    "",
+                    [
+                        {
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"path": "sorting.py", "content": combined_content},
+                            }
+                        }
+                    ],
+                    True,
+                ),
+            ),
+            updates(
+                ("", [{"function": {"name": "search_files", "arguments": {"query": "bubble_sort"}}}], True)
+            ),
+            updates(
+                (
+                    "",
+                    [
+                        {
+                            "function": {
+                                "name": "edit_file",
+                                "arguments": {
+                                    "path": "main.py",
+                                    "old_text": "import bubble_sort\n\nprint(bubble_sort.bubble_sort([3, 1, 2]))\n",
+                                    "new_text": "import sorting\n\nprint(sorting.bubble_sort([3, 1, 2]))\n",
+                                },
+                            }
+                        }
+                    ],
+                    True,
+                ),
+            ),
+            updates(
+                ("", [{"function": {"name": "delete_file", "arguments": {"path": "bubble_sort.py"}}}], True)
+            ),
+            updates(
+                (
+                    "",
+                    [{"function": {"name": "run_command", "arguments": {"program": "pytest", "args": []}}}],
+                    True,
+                ),
+            ),
+            updates(
+                (
+                    "Done: created sorting.py with all five sort functions, updated main.py's import, "
+                    "removed bubble_sort.py, and the tests passed.",
+                    None,
+                    True,
+                ),
+            ),
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Create a new file sorting.py containing bubble_sort, quick_sort, merge_sort, "
+                    "insertion_sort, and selection_sort. Move the old bubble_sort.py implementation "
+                    "into sorting.py, update any imports that reference bubble_sort.py, and remove "
+                    "the old file. Run the tests."
+                ),
+            }
+        ]
+
+        with mock.patch("agent.tools.terminal.subprocess.Popen") as mock_popen:
+            fake_proc = mock.Mock()
+            fake_proc.communicate.return_value = ("2 passed in 0.01s\n", "")
+            fake_proc.returncode = 0
+            fake_proc.pid = 12345
+            mock_popen.return_value = fake_proc
+
+            gen = run_agent_turn(client, sorting_registry, messages, task_state=sorting_task_state)
+            # decisions sent only for confirm-shaped events, in order:
+            # write_file, edit_file, delete_file, run_command
+            events = drive_agent_turn(gen, decisions=[True, True, True, True])
+
+        # No manual nudging was needed: the model never triggered the
+        # narration-correction path (it called a real tool every turn).
+        assert not any(e["type"] == "narration_redirected" for e in events)
+
+        # A genuine final answer was reached, not a stall/incomplete flag.
+        final_events = [e for e in events if e["type"] == "final"]
+        assert len(final_events) == 1
+        assert not final_events[0].get("task_incomplete")
+
+        # Real filesystem state matches the request -- not just the model's
+        # narration of it (see CLAUDE.md's "chat transcript claiming success
+        # is not evidence of success").
+        assert not (sorting_project.root / "bubble_sort.py").exists()
+        assert (sorting_project.root / "sorting.py").exists()
+        sorting_content = (sorting_project.root / "sorting.py").read_text()
+        for fn in ("bubble_sort", "quick_sort", "merge_sort", "insertion_sort", "selection_sort"):
+            assert f"def {fn}(" in sorting_content
+        main_content = (sorting_project.root / "main.py").read_text()
+        assert "import sorting" in main_content
+        assert "import bubble_sort" not in main_content
+
+        # Tests were actually run (via the mocked subprocess), not just claimed.
+        assert any(e["type"] == "command_result" for e in events)
+        assert any(e["type"] == "file_op_applied" for e in events)  # the delete
+        assert any(e["type"] == "change_applied" for e in events)  # the write + edit

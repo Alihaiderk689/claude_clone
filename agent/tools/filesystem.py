@@ -6,6 +6,7 @@ sends as an argument.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import List, Optional
@@ -193,12 +194,30 @@ def _read_file(
         tracker.record(target, text)
 
     if is_cache_hit:
+        # Structured, not conversational: a short "reuse it" sentence read
+        # badly to a small model mid-task (observed live -- it interpreted
+        # the notice as the task being over and stopped to ask what to do
+        # next instead of continuing). Framing this as internal state (path/
+        # status/line count) with an explicit continuation instruction, same
+        # shape as a tool status rather than a reply to a question, measurably
+        # reduces that misreading. The full content deliberately isn't
+        # resent here -- it's still intact earlier in this conversation
+        # (context_manager.compact_messages never supersedes it with this
+        # stub, see its cache_hit-aware pass) -- so this stays cheap on
+        # every repeat read instead of paying the full content's context
+        # cost again; _looks_like_unactioned_narration in loop.py is the
+        # real backstop if a small model still stalls anyway.
+        short_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        line_count = len(text.splitlines())
         return ToolResult(
             ok=True,
             output=(
-                f"'{args.path}' is unchanged since you last read it in this conversation "
-                "(content hash matches). Reuse the version already shown above -- no need to "
-                "read it again unless you think it's stale; pass force=true to re-read anyway."
+                f"path={args.path!r} status=unchanged lines={line_count} hash={short_hash}\n"
+                "Content is identical to your earlier read_file result for this path above in this "
+                "conversation -- use that content, nothing new to see here. The task is NOT done "
+                "yet: proceed immediately with the user's request (e.g. call edit_file/write_file/"
+                "delete_file/rename_file) rather than asking what to do next. Pass force=true only "
+                "if you specifically suspect it's stale."
             ),
             display=f"read_file({args.path!r}) [cached]",
             cache_hit=True,

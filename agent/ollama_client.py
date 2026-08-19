@@ -16,6 +16,54 @@ import requests
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5-coder:3b"
 DEFAULT_TIMEOUT = 120  # generation on CPU can be slow; keep this generous
+# Ollama's own server default is "5m" -- short enough that a normal pause
+# between agent turns (reading a diff, deciding what to ask next) can let the
+# model fall out of memory, so the *next* message pays a multi-second-to-
+# tens-of-seconds reload. 30m keeps it resident for the length of a typical
+# session instead.
+DEFAULT_KEEP_ALIVE = "30m"
+# Left unset before this: Ollama fell back to qwen2.5-coder's own Modelfile
+# default (0.7-0.8 range), tuned for open-ended chat, not for reliably
+# emitting well-formed tool-call JSON on every turn. A lower temperature
+# measurably reduces exactly the kind of drift this codebase already fights
+# elsewhere (see loop.py's fallback tool-call parsing and narration
+# detection) -- more consistent formatting, less creative rewording of "call
+# the tool" into "let me describe what I'd do." Not 0.0: a small amount of
+# variance still helps the model recover after a rejected/failed call
+# instead of deterministically repeating the exact same (wrong) attempt.
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TOP_P = 0.9
+
+
+def _float_from_env(var_name: str, default: float, *, minimum: float, maximum: float) -> float:
+    """Same tolerant-fallback shape as timeout_from_env()/keep_alive_from_env():
+    a missing, non-numeric, or out-of-range value degrades to the default
+    instead of raising or silently sending Ollama a nonsensical setting."""
+    raw = os.environ.get(var_name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if minimum <= value <= maximum else default
+
+
+def temperature_from_env() -> float:
+    return _float_from_env("OLLAMA_TEMPERATURE", DEFAULT_TEMPERATURE, minimum=0.0, maximum=2.0)
+
+
+def top_p_from_env() -> float:
+    return _float_from_env("OLLAMA_TOP_P", DEFAULT_TOP_P, minimum=0.0, maximum=1.0)
+
+
+def keep_alive_from_env() -> str:
+    """Reads OLLAMA_KEEP_ALIVE the same way OLLAMA_TIMEOUT is read. Value is
+    passed through as-is (Ollama accepts durations like "30m"/"1h" or a
+    plain number of seconds; "-1" means never unload). Falls back to
+    DEFAULT_KEEP_ALIVE for a missing/empty value rather than raising."""
+    raw = os.environ.get("OLLAMA_KEEP_ALIVE")
+    return raw if raw else DEFAULT_KEEP_ALIVE
 
 
 def timeout_from_env() -> float:
@@ -65,10 +113,16 @@ class OllamaClient:
         host: str = DEFAULT_HOST,
         model: str = DEFAULT_MODEL,
         timeout: float = DEFAULT_TIMEOUT,
+        keep_alive: str = DEFAULT_KEEP_ALIVE,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
     ) -> None:
         self.host = host.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.keep_alive = keep_alive
+        self.temperature = temperature
+        self.top_p = top_p
 
     def check_connection(self) -> bool:
         """Return True if the Ollama server responds, False otherwise."""
@@ -77,6 +131,22 @@ class OllamaClient:
             return response.status_code == 200
         except requests.exceptions.RequestException:
             return False
+
+    def warm_up(self) -> None:
+        """Block until the model is loaded into Ollama's memory.
+
+        Sends a promptless /api/generate call, which Ollama loads the model
+        for but never generates any tokens against. Called once at startup
+        so the (potentially many-second) cold load happens up front with
+        clear "loading" messaging, instead of silently during the user's
+        first real chat message where it looks like a connection failure or
+        random slowness. Raises the same OllamaError subclasses as chat().
+        """
+        url = f"{self.host}/api/generate"
+        payload = {"model": self.model, "keep_alive": self.keep_alive}
+        response = self._post_stream(url, payload)
+        for _ in response.iter_lines():
+            break
 
     def chat_stream(
         self,
@@ -120,7 +190,13 @@ class OllamaClient:
         cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[dict]:
         url = f"{self.host}/api/chat"
-        payload = {"model": self.model, "messages": messages, "stream": True}
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "keep_alive": self.keep_alive,
+            "options": {"temperature": self.temperature, "top_p": self.top_p},
+        }
         if tools:
             payload["tools"] = tools
 
