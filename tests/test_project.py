@@ -48,6 +48,16 @@ def test_allows_absolute_path_inside_root(project):
     assert resolved == project.root / "src" / "app.py"
 
 
+def test_rejects_unfilled_placeholder_path(project):
+    with pytest.raises(PathSecurityError):
+        project.resolve("<file_path>")
+
+
+def test_rejects_placeholder_embedded_in_a_longer_path(project):
+    with pytest.raises(PathSecurityError):
+        project.resolve("src/<something>")
+
+
 def test_is_ignored_dir(project):
     assert project.is_ignored_dir(".git")
     assert project.is_ignored_dir("node_modules")

@@ -55,6 +55,20 @@ OLLAMA_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 # executing it again and tells the model to change approach instead.
 MAX_CONSECUTIVE_IDENTICAL_CALLS = 3
 
+# What the interception above does NOT do on its own: stop the model from
+# simply issuing the identical call again next turn. Observed live -- a
+# stuck 3B model kept calling git_status with identical (empty) arguments
+# past 10 times in a row, well beyond MAX_CONSECUTIVE_IDENTICAL_CALLS, each
+# one re-triggering the same "stop repeating it" notice that was already
+# being ignored, burning most of MAX_TOOL_ITERATIONS for zero progress
+# instead of ever reaching a final answer. This bounds that: once the
+# interception above has fired this many times in a row for the same
+# signature with no different call in between, the turn gives up and ends
+# outright (task_incomplete, same shape as MAX_NARRATION_RETRIES exhaustion
+# below) rather than continuing to hand the model more chances it has
+# already shown it won't use differently.
+MAX_REPETITION_ESCALATIONS = 2
+
 # Tool names whose successful proposal represents real progress toward a
 # requested change -- used only to gate narration-vs-tool-call detection
 # below (see _looks_like_unactioned_narration). Read-only inspection tools
@@ -194,12 +208,14 @@ def run_agent_turn(
         {"type": "plan_rejected", "name"}             -- user declined; discarded
         {"type": "content", "text"}   -- the final answer text to display
         {"type": "final", "text"}     -- the complete final answer (same text). Carries an
-            extra `"task_incomplete": True` field when the turn ended on a response that
-            still looks like unactioned narration (see MAX_NARRATION_RETRIES) after
-            every corrective retry was exhausted -- a signal for the caller to flag
-            this to the user, not just print it as an ordinary answer. Absent (not
-            `False`) in the normal case, so existing callers that don't check for it
-            behave exactly as before.
+            extra `"task_incomplete": True` field when the turn ended without the model ever
+            reaching a genuine answer -- either a response that still looks like unactioned
+            narration after every corrective retry was exhausted (see MAX_NARRATION_RETRIES), or
+            the same tool call being repeated past MAX_REPETITION_ESCALATIONS interceptions with
+            no different outcome (see MAX_REPETITION_ESCALATIONS) -- a signal for the caller to
+            flag this to the user, not just print it as an ordinary answer. Absent (not `False`)
+            in the normal case, so existing callers that don't check for it behave exactly as
+            before.
         {"type": "narration_redirected", "text", "attempt", "max_attempts"}  -- the model
             produced a plain-text response with no tool call that reads as unactioned
             narration ("I'll create...", "what would you like me to do next?") while no
@@ -214,7 +230,9 @@ def run_agent_turn(
             is not over, this is purely informational for the UI to show "Retrying (2/3)..."
         {"type": "repetition_detected", "name", "args", "count"}  -- the exact same tool call was
             requested MAX_CONSECUTIVE_IDENTICAL_CALLS times in a row; it was NOT executed/proposed
-            again -- the model was told to change approach instead. The turn continues.
+            again -- the model was told to change approach instead. The turn continues, unless this
+            has now fired MAX_REPETITION_ESCALATIONS times in a row for the same signature, in
+            which case the turn ends instead (see "final" below).
 
     Each iteration's response is fully buffered before being shown, because a
     tool call can arrive embedded in ordinary assistant content (see above)
@@ -434,6 +452,24 @@ def run_agent_turn(
                     last_call_signature = signature
 
                 if consecutive_call_count >= MAX_CONSECUTIVE_IDENTICAL_CALLS:
+                    escalation_number = consecutive_call_count - MAX_CONSECUTIVE_IDENTICAL_CALLS + 1
+                    if escalation_number > MAX_REPETITION_ESCALATIONS:
+                        _logger.warning(
+                            "Giving up on this turn: %s repeated %d times in a row with no progress.",
+                            name, consecutive_call_count,
+                        )
+                        stall_text = (
+                            f"Stopping here: {name} was called {consecutive_call_count} times in a row "
+                            "with identical arguments and no different outcome, even after being told "
+                            "to change approach. This usually means the arguments are wrong (e.g. a "
+                            "path that doesn't exist) rather than something another identical retry "
+                            "would fix -- inspect the actual project structure or ask the user for the "
+                            "specific information needed before trying again."
+                        )
+                        messages.append({"role": "assistant", "content": stall_text})
+                        yield {"type": "final", "text": stall_text, "task_incomplete": True}
+                        return
+
                     _logger.warning(
                         "Repetition detected: %s called %d times in a row with identical arguments.",
                         name, consecutive_call_count,

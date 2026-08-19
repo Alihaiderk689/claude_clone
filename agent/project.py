@@ -88,6 +88,21 @@ class ProjectRoot:
         the root, or symlinks that resolve outside the root.
         """
         raw = user_path if user_path not in (None, "") else "."
+
+        # A model that doesn't know the real path sometimes sends an unfilled
+        # template token instead (observed live: read_file(path="<file_path>")
+        # retried verbatim several times in a row). Angle brackets never
+        # appear in a real project path on any platform this runs on, so this
+        # is a reliable signal to reject early with a directive toward the
+        # actual fix (list_files/search_files) instead of a generic "not
+        # found" that invites retrying the same placeholder.
+        if "<" in raw or ">" in raw:
+            raise PathSecurityError(
+                f"'{user_path}' looks like an unfilled placeholder, not a real path. Call "
+                "list_files or search_files to find the actual path in this project, then retry "
+                "with that real path -- do not guess or reuse a template token."
+            )
+
         candidate = Path(raw)
 
         # A bare join of an absolute path onto root silently discards root

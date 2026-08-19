@@ -182,7 +182,12 @@ class TestRepeatedToolCallsAtScale:
     def test_twenty_identical_calls_only_execute_twice(self, registry, project):
         """Repetition detection (loop.py) must cap real executions at
         MAX_CONSECUTIVE_IDENTICAL_CALLS-1 regardless of how many times the
-        model keeps asking, not just eventually give up at max_iterations."""
+        model keeps asking. It must also not let the model keep re-issuing
+        the identical call indefinitely just because interception isn't a
+        real execution -- MAX_REPETITION_ESCALATIONS bounds how many times
+        it will re-explain before giving up on the turn outright, rather
+        than silently spending the rest of max_iterations on a call that has
+        already proven it won't produce a different outcome."""
         client = mock.create_autospec(OllamaClient, instance=True)
         client.chat.side_effect = lambda *a, **k: updates(
             ("", [{"function": {"name": "read_file", "arguments": {"path": "file_0.py"}}}], True)
@@ -194,8 +199,9 @@ class TestRepeatedToolCallsAtScale:
         tool_call_events = [e for e in events if e["type"] == "tool_call" and e["name"] == "read_file"]
         repetition_events = [e for e in events if e["type"] == "repetition_detected"]
         assert len(tool_call_events) == 2
-        assert len(repetition_events) == 18
-        assert events[-1]["type"] == "max_iterations"
+        assert len(repetition_events) == 2
+        assert events[-1]["type"] == "final"
+        assert events[-1]["task_incomplete"] is True
 
 
 class TestManyPlanSteps:

@@ -614,9 +614,10 @@ def render_turn(
                 console.print()
                 if event.get("task_incomplete"):
                     console.print(
-                        "[yellow]⚠ This may not be fully done -- the agent described an action "
-                        "without a tool call actually performing it. Check the result, or ask again "
-                        "more specifically.[/yellow]"
+                        "[yellow]⚠ This may not be fully done -- the agent stopped without a tool "
+                        "call actually completing the request (it either described the action "
+                        "instead of performing it, or got stuck repeating the same call). Check the "
+                        "result, or ask again more specifically.[/yellow]"
                     )
                 console.print()
 

@@ -1628,6 +1628,36 @@ class TestRepetitionDetection:
         assert len(tool_error_events) == 2  # first 2 attempts genuinely fail validation
         assert len(repetition_events) == 1  # 3rd is intercepted instead of failing again
 
+    def test_repetition_gives_up_after_escalation_limit_instead_of_looping_forever(
+        self, registry, project
+    ):
+        """A model that keeps issuing the identical call even after being
+        told to stop (observed live: git_status repeated past 10 times) must
+        not be allowed to burn the rest of max_iterations doing that -- the
+        turn should end on its own, flagged task_incomplete, well before the
+        iteration ceiling."""
+        (project.root / "backend" / "auth.py").write_text("class JWTAuth:\n    pass\n")
+        client = mock.create_autospec(OllamaClient, instance=True)
+        client.chat.side_effect = lambda *a, **k: updates(
+            ("", [{"function": {"name": "read_file", "arguments": {"path": "backend/auth.py"}}}], True),
+        )
+
+        messages = [{"role": "user", "content": "keep reading the same file"}]
+        # Generously above the point the turn should actually end at, so the
+        # test proves early termination rather than merely tolerating it.
+        events = list(run_agent_turn(client, registry, messages, max_iterations=20))
+
+        repetition_events = [e for e in events if e["type"] == "repetition_detected"]
+        final_events = [e for e in events if e["type"] == "final"]
+        max_iterations_events = [e for e in events if e["type"] == "max_iterations"]
+
+        # 2 interceptions (count 3, 4) before the 3rd interception attempt
+        # (count 5) gives up instead of firing a 3rd repetition_detected.
+        assert [e["count"] for e in repetition_events] == [3, 4]
+        assert len(final_events) == 1
+        assert final_events[0]["task_incomplete"] is True
+        assert not max_iterations_events
+
 
 class TestFileOpApprovalFlow:
     """delete_file/rename_file follow the exact same propose/pause/apply

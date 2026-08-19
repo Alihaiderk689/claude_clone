@@ -33,6 +33,37 @@ reliable tool-calling on the 3B model — see "Phase 10: autonomous filesystem o
 tool-calling reliability" below. See README.md for the full user-facing walkthrough, tool list, and
 phase-by-phase feature history.
 
+## Operating principles for Claude Code sessions on this repo
+
+This project is developed across two machines with different Ollama models (a RAM-limited laptop
+running `qwen2.5-coder:3b`, and a second machine that can also run `qwen2.5-coder:7b` for later
+validation). Because of that, code changes here must never depend on how capable the *model
+generating them* happens to be — prefer deterministic tools, explicit workflows, and small
+readable functions over anything that relies on a model "remembering" or "figuring out" state.
+This applies to both layers: the qwen model this agent drives at runtime (see the
+`SYSTEM_PROMPT_TEMPLATE` sections below for that layer) and Claude Code sessions editing this
+codebase itself.
+
+When working in this repo, actually do the work rather than describing it:
+- Inspect before editing — read a file and find the real, existing text before calling an edit
+  tool; never invent a placeholder path and call a tool with it unverified.
+- If a tool call fails, that's information to act on, not a cue to retry the same call — change
+  strategy (re-inspect, pick a different tool, ask only if genuinely blocked on something only the
+  user can decide).
+- Make the actual file changes, run the real test suite (`pytest`, `vscode-extension && npm test`),
+  and fix what testing turns up — don't report an error and stop, and don't claim something was
+  changed or verified without having actually run the check.
+- Preserve the existing architecture and naming conventions (see "Architecture" below) rather than
+  rewriting adjacent code the request didn't ask about.
+- Never claim a test passed, a file changed, or a bug is fixed without having actually run the
+  check in this session — a plausible-sounding result is not a verified one.
+
+Code written here is read next by whichever model opens the repo next, possibly the 7B one on the
+other machine — so favor clear function names, small single-purpose functions, predictable control
+flow, and no hidden state over anything clever, even if the clever version is shorter. Add a
+comment only where the *why* isn't obvious from the code itself (a workaround, a non-obvious
+constraint); don't restate what a well-named function already says.
+
 ## Commands
 
 ```bash
@@ -239,7 +270,14 @@ in `agent/tools/__init__.py` is the one place that wires up the current tool set
 ### Path security is centralized, not per-tool
 
 Every filesystem-touching tool resolves paths through `ProjectRoot.resolve()` (`agent/project.py`),
-never doing its own path math. It rejects `..` traversal and absolute paths outside the root (careful:
+never doing its own path math. **It also rejects an unfilled placeholder path (anything containing
+`<`/`>`, e.g. `read_file(path="<file_path>")`)** — observed live from `qwen2.5-coder:3b`, which
+retried that exact literal several times before the pre-existing repetition guard even kicked in.
+Angle brackets never appear in a real path on any platform this runs on, so this is a safe, cheap
+check to add here once rather than teaching every tool to recognize a template token, and the
+`PathSecurityError` message directs the model at `list_files`/`search_files` instead of a bare "not
+found" that invites retrying the same placeholder. It rejects `..` traversal and absolute paths
+outside the root (careful:
 naively joining an absolute path onto the root with `Path.__truediv__` silently discards the root —
 `resolve()` handles this correctly, don't reimplement path joining elsewhere). `ProjectRoot` also owns
 the ignored-directories list (`.git`, `node_modules`, `.venv`, etc.) and the sensitive-filename patterns
@@ -459,6 +497,23 @@ synthetic tool result telling the model to change approach, yielding `{"type":
 with no progress (e.g. re-reading the same file) and one that keeps failing the same way (e.g.
 re-proposing a rejected edit) — they're the same signature-repeats-3-times pattern from this code's
 point of view. A different, non-identical call resets the streak immediately.
+
+**Interception alone doesn't stop a model from just asking again — `MAX_REPETITION_ESCALATIONS`
+bounds that too.** Live testing surfaced the actual gap: `qwen2.5-coder:3b` kept issuing an
+identical `git_status()` call *past 10 times in a row* after the first `repetition_detected`
+correction fired — each interception is real (no re-execution), but nothing previously stopped the
+model from simply requesting the same call again next iteration, so the turn silently burned most
+of `MAX_TOOL_ITERATIONS` and ended in an unhelpful `max_iterations` with no answer at all. Once
+`consecutive_call_count` has triggered interception `MAX_REPETITION_ESCALATIONS` (2) times in a
+row for the same signature (i.e. the 5th identical attempt), the turn now gives up outright —
+`{"type": "final", "task_incomplete": True}` — instead of yielding a 3rd `repetition_detected` and
+continuing. Same bounded-then-stop shape as `MAX_NARRATION_RETRIES` below, applied to this
+different signal; `cli.py`'s `task_incomplete` rendering was generalized to cover both causes
+rather than assuming narration. `tests/test_loop.py::TestRepetitionDetection::
+test_repetition_gives_up_after_escalation_limit_instead_of_looping_forever` and
+`tests/test_stress.py::TestRepeatedToolCallsAtScale::test_twenty_identical_calls_only_execute_twice`
+(updated — it previously asserted the old unbounded-looping behavior as if it were correct) cover
+this.
 
 **Ollama retries are a `while True` around the model call inside the per-iteration loop, not a
 decorator or a separate retry module.** Only `OllamaConnectionError`/`OllamaTimeoutError` retry (up to
