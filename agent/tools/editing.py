@@ -10,7 +10,9 @@ validates and writes, the user approves in between.
 """
 from __future__ import annotations
 
+import ast
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
@@ -26,10 +28,58 @@ from .base import (
     Tool,
     ToolError,
     ToolResult,
+    ValidationFailedError,
 )
 from .state import FileStateTracker
 
 DEFAULT_NEW_FILE_MODE = 0o644
+
+# Same live-observed failure as the path-placeholder guard in project.py,
+# one level up the call: instead of a placeholder *path*, the model sends a
+# placeholder *argument value* -- e.g. old_text='<existing text to replace>'
+# or new_text='<new content here>' -- after already having the file's real
+# content in front of it from an earlier read_file call. Unlike a path,
+# arbitrary code legitimately contains '<'/'>' (comparisons, generics,
+# HTML), so the check here is deliberately narrower than project.py's: it
+# only matches when the *entire* argument, trimmed, is nothing but one
+# bracketed phrase -- real old_text/new_text (even a single short line) is
+# never shaped like that.
+_PLACEHOLDER_TOKEN_RE = re.compile(r"^<[^<>\n]{1,200}>$")
+
+
+def _looks_like_placeholder_token(text: str) -> bool:
+    return bool(_PLACEHOLDER_TOKEN_RE.match(text.strip()))
+
+
+# A model can pass every content-shape check above (real text, not a
+# placeholder) and still produce Python that doesn't parse -- observed live:
+# qwen2.5-coder:3b generated a bubble_sort() body where every line, at every
+# nesting depth (function body, for loop, nested for loop, if statement),
+# used the exact same single-space indent, which is a genuine IndentationError,
+# not a style nitpick. Nothing before this point ever ran the proposed content
+# through a real Python parser, so that would have been shown to the user as
+# an approvable diff and wrote a syntax-broken file on approval -- "the tool
+# succeeded" and "the file is valid Python" are not the same claim, and only
+# the second one actually matters. ast.parse is stdlib (no new dependency,
+# consistent with this project's "don't add a dependency without reason"
+# rule) and catches IndentationError/TabError too, since both subclass
+# SyntaxError. Scoped to .py files only -- this agent's tools are otherwise
+# language-agnostic and have no general syntax checker for anything else.
+def _validate_python_syntax(path: str, content: str) -> None:
+    if not path.endswith(".py"):
+        return
+    try:
+        ast.parse(content, filename=path)
+    except SyntaxError as exc:
+        location = f"line {exc.lineno}" + (f", column {exc.offset}" if exc.offset else "")
+        offending_line = (exc.text or "").rstrip("\n")
+        detail = f"\n    {offending_line}" if offending_line.strip() else ""
+        raise ValidationFailedError(
+            f"The resulting content for '{path}' is not valid Python: {exc.msg} ({location}).{detail}\n"
+            "This is usually an indentation mistake (e.g. every nested line using the same "
+            "indent instead of increasing it for each nested block). Fix the syntax and propose "
+            "the edit again -- nothing was written."
+        ) from exc
 
 
 class EditFileArgs(BaseModel):
@@ -91,6 +141,18 @@ def _edit_file(
             "existing content as old_text. If you actually mean to replace the file's entire "
             "content, delete_file it first, then write_file the new content."
         )
+    if _looks_like_placeholder_token(args.old_text):
+        raise ToolError(
+            f"old_text ({args.old_text!r}) looks like an unfilled placeholder, not real content "
+            f"copied from the file. Look at your most recent read_file('{args.path}') result in this "
+            "conversation and copy an exact, real line (or block of lines) from it as old_text -- "
+            "don't describe or paraphrase what you want to replace."
+        )
+    if _looks_like_placeholder_token(args.new_text):
+        raise ToolError(
+            f"new_text ({args.new_text!r}) looks like an unfilled placeholder, not real "
+            "replacement content. Write out the actual code/text that should replace old_text."
+        )
     if args.old_text == args.new_text:
         raise ToolError("old_text and new_text are identical; there's nothing to change.")
 
@@ -130,6 +192,7 @@ def _edit_file(
     new_size = len(new_normalized.encode("utf-8"))
     if new_size > HARD_MAX_FILE_SIZE_BYTES:
         raise ToolError(f"The edited file would be {new_size:,} bytes, far too large.")
+    _validate_python_syntax(args.path, new_normalized)
 
     change = ProposedChange(
         path=args.path,
@@ -170,6 +233,7 @@ def _write_file(
     content_size = len(args.content.encode("utf-8"))
     if content_size > HARD_MAX_FILE_SIZE_BYTES:
         raise ToolError(f"The new file would be {content_size:,} bytes, far too large.")
+    _validate_python_syntax(args.path, args.content)
 
     change = ProposedChange(
         path=args.path,

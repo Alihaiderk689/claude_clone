@@ -132,10 +132,119 @@ class TestEditFilePropose:
         result = edit_tool.execute({"path": "backend/auth.py", "old_text": "", "new_text": "y"})
         assert not result.ok
 
+    def test_placeholder_old_text_rejected_with_a_directive_message(self, edit_tool):
+        """Observed live: a small model, after already calling read_file
+        successfully, sent old_text='<existing text to replace>' instead of
+        real content copied from that read. This must fail with a message
+        that points at read_file's output, not the generic 'not found'
+        error a real (but wrong) old_text would get -- that generic message
+        was observed live not being enough to redirect the model."""
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "<existing text to replace>",
+                "new_text": "y = 1",
+            }
+        )
+        assert not result.ok
+        assert "placeholder" in result.output.lower()
+        assert "read_file" in result.output
+
+    def test_placeholder_new_text_rejected(self, edit_tool):
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "return None",
+                "new_text": "<new content here>",
+            }
+        )
+        assert not result.ok
+        assert "placeholder" in result.output.lower()
+
+    def test_real_old_text_containing_angle_brackets_is_still_allowed(self, project, tracker):
+        """The placeholder check must be narrow enough that genuine code
+        using '<'/'>' (comparisons, generics, HTML) is never blocked -- only
+        an argument that is *entirely* one bracketed phrase is rejected."""
+        target = project.root / "generic.py"
+        target.write_text("def f(x):\n    return x < 10 and x > 0\n")
+        tracker.record(target, target.read_text())
+        edit_tool = build_edit_file_tool(project, tracker)
+
+        result = edit_tool.execute(
+            {
+                "path": "generic.py",
+                "old_text": "return x < 10 and x > 0",
+                "new_text": "return 0 < x < 10",
+            }
+        )
+        assert result.ok
+        assert result.pending_change is not None
+
     def test_malformed_arguments_rejected(self, edit_tool):
         result = edit_tool.execute({"path": "backend/auth.py"})  # missing old_text/new_text
         assert not result.ok
         assert "invalid arguments" in result.output.lower()
+
+    def test_edit_producing_invalid_python_indentation_is_rejected(self, project, tracker):
+        """The exact live-observed failure: every nested line (function
+        body, for loop, nested for loop, if statement) at the same 1-space
+        indent instead of increasing per block -- a real IndentationError,
+        not just unconventional style. Must be caught before it's ever
+        proposed as an approvable diff, let alone written to disk."""
+        target = project.root / "sorter.py"
+        target.write_text("def bubble_sort(arr):\n    pass\n")
+        tracker.record(target, target.read_text())
+        edit_tool = build_edit_file_tool(project, tracker)
+
+        broken_body = (
+            "def bubble_sort(arr):\n"
+            " n = len(arr)\n"
+            " for i in range(n):\n"
+            " for j in range(0, n-i-1):\n"
+            " if arr[j] > arr[j+1]:\n"
+            " arr[j], arr[j+1] = arr[j+1], arr[j]\n"
+        )
+        result = edit_tool.execute(
+            {"path": "sorter.py", "old_text": "def bubble_sort(arr):\n    pass\n", "new_text": broken_body}
+        )
+        assert not result.ok
+        assert result.pending_change is None
+        assert "not valid python" in result.output.lower()
+        assert "line" in result.output.lower()
+
+    def test_edit_producing_valid_python_is_still_allowed(self, project, tracker):
+        target = project.root / "sorter.py"
+        target.write_text("def bubble_sort(arr):\n    pass\n")
+        tracker.record(target, target.read_text())
+        edit_tool = build_edit_file_tool(project, tracker)
+
+        correct_body = (
+            "def bubble_sort(arr):\n"
+            "    n = len(arr)\n"
+            "    for i in range(n):\n"
+            "        for j in range(0, n - i - 1):\n"
+            "            if arr[j] > arr[j + 1]:\n"
+            "                arr[j], arr[j + 1] = arr[j + 1], arr[j]\n"
+        )
+        result = edit_tool.execute(
+            {"path": "sorter.py", "old_text": "def bubble_sort(arr):\n    pass\n", "new_text": correct_body}
+        )
+        assert result.ok
+        assert result.pending_change is not None
+
+    def test_syntax_check_is_skipped_for_non_python_files(self, project, tracker):
+        """The checker is Python-specific -- it must not reject content in
+        any other file type just because it wouldn't parse as Python."""
+        target = project.root / "notes.md"
+        target.write_text("# Notes\nold line\n")
+        tracker.record(target, target.read_text())
+        edit_tool = build_edit_file_tool(project, tracker)
+
+        result = edit_tool.execute(
+            {"path": "notes.md", "old_text": "old line", "new_text": "def broken(:\n  not python"}
+        )
+        assert result.ok
+        assert result.pending_change is not None
 
     def test_stale_file_is_refused(self, project, tracker):
         target = project.root / "backend" / "auth.py"
@@ -210,6 +319,19 @@ class TestWriteFilePropose:
     def test_malformed_arguments_rejected(self, write_tool):
         result = write_tool.execute({"path": "backend/new.py"})  # missing content
         assert not result.ok
+
+    def test_new_file_with_invalid_python_syntax_is_rejected(self, write_tool):
+        result = write_tool.execute(
+            {"path": "backend/broken.py", "content": "def f(:\n    return 1\n"}
+        )
+        assert not result.ok
+        assert result.pending_change is None
+        assert "not valid python" in result.output.lower()
+
+    def test_new_non_python_file_with_python_like_garbage_is_still_allowed(self, write_tool):
+        result = write_tool.execute({"path": "backend/notes.txt", "content": "def f(:\n  nonsense"})
+        assert result.ok
+        assert result.pending_change is not None
 
 
 class TestApplyChange:

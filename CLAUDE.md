@@ -276,7 +276,25 @@ retried that exact literal several times before the pre-existing repetition guar
 Angle brackets never appear in a real path on any platform this runs on, so this is a safe, cheap
 check to add here once rather than teaching every tool to recognize a template token, and the
 `PathSecurityError` message directs the model at `list_files`/`search_files` instead of a bare "not
-found" that invites retrying the same placeholder. It rejects `..` traversal and absolute paths
+found" that invites retrying the same placeholder.
+
+**The same failure mode showed up one argument later, and needed a separate, narrower guard.**
+Once the path guard above was in place, live testing surfaced the model clearing that hurdle
+(`list_files` → `read_file` → real content in hand) and then calling `edit_file` with
+`old_text='<existing text to replace>'`/`new_text='<new content here>'` instead of copying the real
+text it just read. `agent/tools/editing.py`'s `_looks_like_placeholder_token()` catches this, but
+deliberately *cannot* reuse `ProjectRoot`'s "contains `<`/`>`" rule — `old_text`/`new_text` are
+arbitrary source code, where `<`/`>` legitimately appear (comparisons, generics, HTML), unlike a
+path. Its regex (`^<[^<>\n]{1,200}>$`) only matches when the *entire* trimmed argument is nothing
+but one bracketed phrase, which real code is never shaped like even for a single short line —
+`tests/test_tools_editing.py::TestEditFilePropose::
+test_real_old_text_containing_angle_brackets_is_still_allowed` locks in that a genuine `x < 10 and
+x > 0` edit still works. The resulting `ToolError` names which argument was the placeholder and
+points at the specific `read_file(...)` call to copy from, rather than the generic "target text not
+found" a real-but-wrong `old_text` gets — that generic message was tried first, live, and wasn't
+specific enough to redirect the model away from repeating the same placeholder shape.
+
+It rejects `..` traversal and absolute paths
 outside the root (careful:
 naively joining an absolute path onto the root with `Path.__truediv__` silently discards the root —
 `resolve()` handles this correctly, don't reimplement path joining elsewhere). `ProjectRoot` also owns
@@ -295,6 +313,37 @@ not just an inconvenience).
 `git_policy.py`'s `validate_stage_paths()` does the same for `git_stage` — extend/reuse
 `ProjectRoot.resolve()`, don't duplicate path-containment logic, if a new tool needs the same
 guarantee.
+
+### Proposed Python content is syntax-checked before it's ever shown as a diff
+
+Everything above catches a model sending the *wrong kind of argument* (a placeholder path, a
+placeholder block of content). It does not catch a model sending a *real, well-intentioned* new/
+new_text value that simply isn't valid Python — live-observed in the exact same session as the
+placeholder failures above: `qwen2.5-coder:3b` generated a `bubble_sort()` body where every nested
+line (the function body, the `for` loop, the nested `for` loop, the `if` statement) used the
+identical single-space indent instead of increasing per block — a genuine `IndentationError`, not a
+style choice. Nothing before this checked that the resulting file content would actually parse, so
+that content would have been shown to the user as an approvable diff and, on approval, written to
+disk as broken Python — "the tool call succeeded" and "the file is valid Python" are different
+claims, and only the second one actually matters to the user.
+
+`agent/tools/editing.py`'s `_validate_python_syntax(path, content)` closes this: both `_edit_file`
+(against the post-edit `new_normalized` content) and `_write_file` (against `args.content`) run it
+right before building the `ProposedChange`, so a syntax error is caught *before* proposal, not
+after approval. It's a thin wrapper around stdlib `ast.parse()` — no new dependency, consistent
+with this project's "don't add a dependency without reason" rule — which also catches
+`IndentationError`/`TabError` for free since both subclass `SyntaxError`. The resulting
+`ValidationFailedError` reports the real line/column and message from the parser and names the
+likely cause (inconsistent indentation) rather than a generic "invalid content," giving the model
+something concrete to fix rather than just a reason to guess again.
+
+**Deliberately scoped to `.py` files only** (`path.endswith(".py")`) — this agent's tools are
+otherwise language-agnostic, and there's no general multi-language syntax checker to extend this
+to; `tests/test_tools_editing.py`'s `test_syntax_check_is_skipped_for_non_python_files` and
+`test_new_non_python_file_with_python_like_garbage_is_still_allowed` lock in that a `.md`/`.txt`
+file containing Python-shaped garbage is never blocked by this. If a future language gets its own
+deterministic syntax check, give it its own scoped helper the same way rather than trying to
+generalize `_validate_python_syntax` into something it isn't.
 
 ### Stale-edit detection
 

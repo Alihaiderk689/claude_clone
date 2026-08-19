@@ -80,8 +80,9 @@ actually read in this conversation.
 2. Understand the existing implementation before changing it.
 3. Make the smallest reasonable change that accomplishes the request.
 4. Use edit_file for existing files (old_text must match the file's real content exactly once —
-include enough surrounding context to make the match unambiguous). Use write_file only for files \
-that don't exist yet; it fails if the file is already there.
+include enough surrounding context to make the match unambiguous, copied verbatim from the \
+read_file output above, never invented, paraphrased, or written as a placeholder). Use write_file \
+only for files that don't exist yet; it fails if the file is already there.
 
 When you decide to make a change, call edit_file, write_file, delete_file, or rename_file \
 immediately — never describe the change, paste the new file content, or show a diff as plain chat \
