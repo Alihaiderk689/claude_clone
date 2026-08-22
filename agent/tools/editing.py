@@ -15,7 +15,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,166 @@ _PLACEHOLDER_TOKEN_RE = re.compile(r"^<[^<>\n]{1,200}>$")
 
 def _looks_like_placeholder_token(text: str) -> bool:
     return bool(_PLACEHOLDER_TOKEN_RE.match(text.strip()))
+
+
+# read_file renders a file as "  12 | def foo():" -- the line number and pipe
+# are display furniture, not part of the file. A model told to copy old_text
+# "verbatim from the read_file output" will often copy that prefix too, and
+# then nothing matches, because the prefix is not in the file on disk. This
+# was the single largest source of "Target text not found" failures with a
+# small local model. Rather than only documenting the rule (see the tool
+# description and the system prompt, both updated), strip the prefix
+# defensively -- but only as a *fallback* after a literal match has already
+# failed, and only when EVERY non-blank line carries it, which is the
+# signature of a copy-paste from read_file and not of real source code.
+_LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s*\|\s?")
+
+
+def _strip_line_number_prefixes(text: str) -> str:
+    """Remove read_file's 'NNN | ' prefix from every line, or return `text`
+    unchanged if it doesn't uniformly look like line-numbered read_file
+    output. Never partially strips: it's all lines or none."""
+    lines = text.split("\n")
+    meaningful = [line for line in lines if line.strip()]
+    if not meaningful:
+        return text
+    if not all(_LINE_NUMBER_PREFIX_RE.match(line) for line in meaningful):
+        return text
+    return "\n".join(
+        _LINE_NUMBER_PREFIX_RE.sub("", line) if line.strip() else line for line in lines
+    )
+
+
+def _occurrence_lines(haystack: str, needle: str, limit: int = 10) -> List[int]:
+    """1-indexed line numbers where `needle` starts in `haystack`. Reported
+    back to the model on an ambiguous match so it can add context around a
+    specific occurrence instead of guessing which one is which."""
+    found: List[int] = []
+    idx = haystack.find(needle)
+    while idx != -1 and len(found) < limit:
+        found.append(haystack.count("\n", 0, idx) + 1)
+        idx = haystack.find(needle, idx + 1)
+    return found
+
+
+def _as_block(text: str) -> List[str]:
+    """Split into lines, dropping the empty trailing element a trailing
+    newline produces -- whitespace-insensitive matching works on whole
+    lines, so a trailing "\n" must not demand an extra blank line."""
+    lines = text.split("\n")
+    if len(lines) > 1 and lines[-1] == "":
+        lines = lines[:-1]
+    return lines
+
+
+def _dedent_block(lines: List[str]) -> List[str]:
+    """Strip the common leading indentation off a block, preserving the
+    relative nesting inside it. Blank lines become truly empty."""
+    indents = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
+    base = min(indents) if indents else 0
+    return [line[base:] if line.strip() else "" for line in lines]
+
+
+def _apply_literal(
+    path: str, normalized: str, old_text: str, new_text: str, count: int, replace_all: bool
+) -> str:
+    if count > 1 and not replace_all:
+        where = ", ".join(str(n) for n in _occurrence_lines(normalized, old_text))
+        raise ToolError(
+            f"old_text appears {count} times in '{path}' (starting at lines {where}), so the edit "
+            "is ambiguous. Either include more surrounding context in old_text so it matches "
+            "exactly once, or pass replace_all=true to change every occurrence."
+        )
+    return normalized.replace(old_text, new_text, -1 if replace_all else 1)
+
+
+def _apply_whitespace_insensitive(
+    path: str, normalized: str, old_text: str, new_text: str, replace_all: bool
+) -> str:
+    """Last-resort match that compares lines by their stripped content, then
+    re-applies the file's own indentation to the replacement.
+
+    This is what rescues an edit whose only defect is indentation drift --
+    a small model reproducing a block it read but flattening or shifting the
+    leading whitespace. Only reached after both literal strategies fail, and
+    still refuses an ambiguous match, so it loosens *whitespace* matching
+    without loosening the "exactly one target" guarantee.
+    """
+    file_lines = normalized.split("\n")
+    old_lines = _as_block(old_text)
+    new_lines = _as_block(new_text)
+
+    span = len(old_lines)
+    target = [line.strip() for line in old_lines]
+    starts = [
+        i
+        for i in range(len(file_lines) - span + 1)
+        if [line.strip() for line in file_lines[i : i + span]] == target
+    ]
+
+    if not starts:
+        raise ToolError(
+            f"Target text not found in '{path}'. Three things to check, in order: (1) old_text "
+            "must be the file's real content -- do NOT include read_file's 'NNN | ' line-number "
+            "prefixes, those are display only and are not in the file; (2) copy a real, "
+            "contiguous block from your most recent read_file result for this path, not a "
+            "paraphrase; (3) if you want to replace the file's entire content rather than one "
+            "block, call write_file with overwrite=true and the complete new content instead."
+        )
+    if len(starts) > 1 and not replace_all:
+        where = ", ".join(str(i + 1) for i in starts)
+        raise ToolError(
+            f"old_text matches {len(starts)} places in '{path}' (ignoring indentation; at lines "
+            f"{where}), so the edit is ambiguous. Either include more surrounding context in "
+            "old_text so it matches exactly once, or pass replace_all=true to change every "
+            "occurrence."
+        )
+
+    dedented_new = _dedent_block(new_lines)
+    for start in reversed(starts if replace_all else starts[:1]):
+        matched = file_lines[start : start + span]
+        # Anchor on the shallowest matched line rather than the first one:
+        # identical for a block that starts at its own outermost level (the
+        # common case), but correct for one that starts deeper than it ends.
+        widths = [len(line) - len(line.lstrip()) for line in matched if line.strip()]
+        base_indent = " " * (min(widths) if widths else 0)
+        file_lines[start : start + span] = [
+            base_indent + line if line else "" for line in dedented_new
+        ]
+    return "\n".join(file_lines)
+
+
+def _resolve_replacement(
+    path: str, normalized: str, old_text: str, new_text: str, replace_all: bool
+) -> str:
+    """Produce the file's new content, trying progressively more forgiving
+    match strategies. Order matters: an exact literal match always wins, so
+    neither fallback can change the result of an edit that was already
+    correct -- they only turn a hard failure into a success.
+    """
+    # 1. Exact literal match, exactly as before.
+    count = normalized.count(old_text)
+    if count:
+        return _apply_literal(path, normalized, old_text, new_text, count, replace_all)
+
+    # 2. Same, after stripping read_file's line-number prefixes.
+    stripped_old = _strip_line_number_prefixes(old_text)
+    stripped_new = _strip_line_number_prefixes(new_text)
+    if stripped_old != old_text:
+        count = normalized.count(stripped_old)
+        if count:
+            if stripped_old == stripped_new:
+                raise ValidationFailedError(
+                    "old_text and new_text are identical once read_file's 'NNN | ' line-number "
+                    "prefixes are removed, so there's nothing to change. Those prefixes are "
+                    "display only -- write new_text as the real replacement code."
+                )
+            return _apply_literal(path, normalized, stripped_old, stripped_new, count, replace_all)
+
+    # 3. Whitespace-insensitive line matching, on the best variant available.
+    return _apply_whitespace_insensitive(
+        path, normalized, stripped_old, stripped_new, replace_all
+    )
 
 
 # A model can pass every content-shape check above (real text, not a
@@ -85,14 +245,34 @@ def _validate_python_syntax(path: str, content: str) -> None:
 class EditFileArgs(BaseModel):
     path: str = Field(description="Existing file to edit, relative to the project root.")
     old_text: str = Field(
-        description="Exact existing text to replace. Must appear exactly once in the file."
+        description=(
+            "Existing text to replace, copied from the file's real content. Do NOT include the "
+            "'NNN | ' line-number prefixes read_file adds for display -- they are not part of the "
+            "file. Must identify exactly one place unless replace_all is set."
+        )
     )
     new_text: str = Field(description="Text to replace old_text with.")
+    replace_all: bool = Field(
+        default=False,
+        description=(
+            "Set true to replace every occurrence of old_text instead of failing when it appears "
+            "more than once. Leave false (the default) when you mean one specific place."
+        ),
+    )
 
 
 class WriteFileArgs(BaseModel):
-    path: str = Field(description="New file to create, relative to the project root.")
-    content: str = Field(description="Full content of the new file.")
+    path: str = Field(description="File to create, relative to the project root.")
+    content: str = Field(description="Full content of the file.")
+    overwrite: bool = Field(
+        default=False,
+        description=(
+            "Set true to replace an existing file's entire content with `content`. Leave false "
+            "(the default) to create a new file only, failing if the path already exists. Use "
+            "overwrite=true when you mean to rewrite a whole file in one step -- for changing "
+            "part of a file, edit_file is still the right tool."
+        ),
+    )
 
 
 def _safe_resolve(project: ProjectRoot, path: str) -> Path:
@@ -139,7 +319,7 @@ def _edit_file(
             "cannot insert/append/rewrite a file with no anchor. If you haven't called read_file on "
             "this path yet in this conversation, do that first and choose a real block of its "
             "existing content as old_text. If you actually mean to replace the file's entire "
-            "content, delete_file it first, then write_file the new content."
+            "content, call write_file with overwrite=true and the complete new content instead."
         )
     if _looks_like_placeholder_token(args.old_text):
         raise ToolError(
@@ -176,19 +356,13 @@ def _edit_file(
             "stale edit — read_file it again and re-propose the edit against its current content."
         )
 
-    occurrences = normalized.count(args.old_text)
-    if occurrences == 0:
-        raise ToolError(
-            f"Target text not found in '{args.path}'. Re-read the file and provide an exact match "
-            "for old_text (whitespace and indentation must match exactly)."
+    new_normalized = _resolve_replacement(
+        args.path, normalized, args.old_text, args.new_text, args.replace_all
+    )
+    if new_normalized == normalized:
+        raise ValidationFailedError(
+            f"The proposed edit would leave '{args.path}' unchanged; there's nothing to apply."
         )
-    if occurrences > 1:
-        raise ToolError(
-            f"old_text appears {occurrences} times in '{args.path}', so the edit is ambiguous. "
-            "Include more surrounding context in old_text so it matches exactly once."
-        )
-
-    new_normalized = normalized.replace(args.old_text, args.new_text, 1)
     new_size = len(new_normalized.encode("utf-8"))
     if new_size > HARD_MAX_FILE_SIZE_BYTES:
         raise ToolError(f"The edited file would be {new_size:,} bytes, far too large.")
@@ -224,16 +398,55 @@ def _write_file(
         already_exists = target.exists()
     except PermissionError as exc:
         raise PermissionDeniedError(f"Permission denied accessing '{args.path}': {exc}") from exc
-    if already_exists:
+    if already_exists and not args.overwrite:
         raise ToolError(
-            f"'{args.path}' already exists. Use edit_file to modify an existing file instead of "
-            "write_file, which is only for creating new files."
+            f"'{args.path}' already exists. Use edit_file to change part of it. If you actually "
+            "mean to replace the file's entire content in one step -- for instance because "
+            "edit_file keeps failing to match -- retry write_file with overwrite=true and the "
+            "complete new content."
         )
 
     content_size = len(args.content.encode("utf-8"))
     if content_size > HARD_MAX_FILE_SIZE_BYTES:
         raise ToolError(f"The new file would be {content_size:,} bytes, far too large.")
     _validate_python_syntax(args.path, args.content)
+
+    if already_exists:
+        # Deliberately a whole-file replacement, not a patch, so there is no
+        # read-before-write staleness check here: overwrite=true exists as the
+        # escape hatch for when edit_file's anchor matching keeps failing, and
+        # requiring a fresh read first would reintroduce the very failure it's
+        # meant to route around. The user still sees the full diff against
+        # what's on disk right now and still has to approve it -- that, not a
+        # hash comparison, is what stops an unintended clobber. Modelled as
+        # kind="edit" so the diff, the "Modified file" label, and the original
+        # mode/newline preservation all come out right.
+        try:
+            existing_raw = target.read_bytes()
+        except PermissionError as exc:
+            raise PermissionDeniedError(
+                f"Permission denied reading '{args.path}': {exc}"
+            ) from exc
+        old_normalized, newline = _decode_and_detect_newline(existing_raw)
+        if old_normalized == args.content:
+            raise ValidationFailedError(
+                f"'{args.path}' already contains exactly this content; there's nothing to change."
+            )
+        change = ProposedChange(
+            path=args.path,
+            resolved_path=target,
+            kind="edit",
+            old_content=old_normalized,
+            new_content=args.content,
+            newline=newline,
+            original_mode=target.stat().st_mode,
+        )
+        return ToolResult(
+            ok=True,
+            output="(pending user approval)",
+            display=f"write_file({args.path!r}, overwrite=True)",
+            pending_change=change,
+        )
 
     change = ProposedChange(
         path=args.path,
@@ -336,11 +549,16 @@ def build_edit_file_tool(project: ProjectRoot, tracker: Optional[FileStateTracke
     return Tool(
         name="edit_file",
         description=(
-            "Propose replacing an exact block of text in an existing file with new text. "
-            "old_text must match the file's current content exactly once — include enough "
-            "surrounding context to make the match unambiguous. This only proposes the change: "
-            "the user is shown a diff and must approve it before anything is written. Read the "
-            "file first with read_file so old_text matches its real, current content."
+            "Propose replacing a block of text in an existing file with new text. Read the file "
+            "first with read_file so old_text is its real, current content. IMPORTANT: read_file "
+            "displays each line as 'NNN | code' — the line number, spaces and '|' are display "
+            "only and are NOT in the file, so strip that prefix and pass just the code as "
+            "old_text. Include enough surrounding context that old_text identifies exactly one "
+            "place; if it appears more than once the tool tells you which lines, and you can "
+            "either add context or pass replace_all=true to change every occurrence. To replace "
+            "a whole file rather than a block, use write_file with overwrite=true. This only "
+            "proposes the change: the user is shown a diff and must approve it before anything "
+            "is written."
         ),
         args_model=EditFileArgs,
         run=lambda args: _edit_file(project, tracker, args),
@@ -351,9 +569,12 @@ def build_write_file_tool(project: ProjectRoot, tracker: Optional[FileStateTrack
     return Tool(
         name="write_file",
         description=(
-            "Propose creating a brand-new file with the given content. Fails if the file already "
-            "exists — use edit_file to modify existing files. This only proposes the change: the "
-            "user is shown the new file's content as a diff and must approve it before it's created."
+            "Propose creating a new file with the given content, or replacing an existing file's "
+            "entire content when overwrite=true. Without overwrite it fails if the path already "
+            "exists. Prefer edit_file for changing part of an existing file; reach for "
+            "overwrite=true when you mean to rewrite the whole file, including when edit_file "
+            "cannot match the text you want to change. This only proposes the change: the user "
+            "is shown a diff and must approve it before anything is written."
         ),
         args_model=WriteFileArgs,
         run=lambda args: _write_file(project, tracker, args),

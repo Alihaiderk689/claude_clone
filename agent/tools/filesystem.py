@@ -274,7 +274,9 @@ def build_read_file_tool(
         name="read_file",
         description=(
             "Read the contents of a single file inside the project, relative to the project root. "
-            "Returns line-numbered text. For large files, pass start_line/end_line to read a "
+            "Returns the file as 'NNN | code' lines. The line number, spaces and '|' are display "
+            "formatting only and are NOT part of the file -- strip that prefix before reusing any "
+            "of this text as edit_file's old_text. For large files, pass start_line/end_line to read a "
             "portion instead of guessing; the tool will tell you if a full read is too large. If "
             "you already read this exact file earlier and it hasn't changed, this returns a short "
             "'unchanged' notice instead of the full content again -- reuse what you already have."

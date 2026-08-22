@@ -441,3 +441,311 @@ class TestApplyChange:
 
         assert not apply_result.ok
         assert "doesn't match" in apply_result.output.lower()
+
+
+class TestLineNumberPrefixTolerance:
+    """Fix 1: read_file renders 'NNN | code', but the file on disk has no such
+    prefix. A model copying its own read_file output verbatim into old_text
+    was the single largest source of "target text not found" failures."""
+
+    def test_old_text_with_read_file_line_numbers_still_matches(self, edit_tool, project):
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "    4 |     return None",
+                "new_text": "    return {'error': 'bad'}",
+            }
+        )
+
+        assert result.ok, result.output
+        change = result.pending_change
+        assert "return {'error': 'bad'}" in change.new_content
+        # The prefix itself must never reach the file.
+        assert "|" not in change.new_content
+        assert "4 |" not in change.new_content
+
+    def test_multiline_old_text_with_line_numbers_matches(self, edit_tool):
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "    2 |     if username == 'admin' and password == '1234':\n"
+                "    3 |         return {'token': 'abc123'}",
+                "new_text": "    if check(username, password):\n        return issue_token()",
+            }
+        )
+
+        assert result.ok, result.output
+        assert "check(username, password)" in result.pending_change.new_content
+        assert "abc123" not in result.pending_change.new_content
+
+    def test_line_numbers_stripped_from_new_text_too(self, edit_tool):
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "    4 |     return None",
+                "new_text": "    4 |     return {}",
+            }
+        )
+
+        assert result.ok, result.output
+        assert "return {}" in result.pending_change.new_content
+        assert "4 |" not in result.pending_change.new_content
+
+    def test_identical_after_stripping_is_rejected(self, edit_tool):
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "    4 |     return None",
+                "new_text": "    4 |     return None",
+            }
+        )
+
+        assert not result.ok
+        assert "nothing to change" in result.output.lower()
+
+    def test_real_content_that_merely_looks_numbered_is_not_mangled(self, project, tracker):
+        """The strip only fires when a literal match already failed AND every
+        non-blank line carries the prefix -- real pipe-containing code must
+        keep working."""
+        (project.root / "data.txt").write_text("1 | alpha\n2 | beta\n")
+        tool = build_edit_file_tool(project, tracker)
+
+        result = tool.execute(
+            {"path": "data.txt", "old_text": "2 | beta", "new_text": "2 | gamma"}
+        )
+
+        assert result.ok, result.output
+        assert result.pending_change.new_content == "1 | alpha\n2 | gamma\n"
+
+    def test_exact_match_always_wins_over_stripping(self, project, tracker):
+        (project.root / "mixed.txt").write_text("   7 | keep\nreal line\n")
+        tool = build_edit_file_tool(project, tracker)
+
+        result = tool.execute(
+            {"path": "mixed.txt", "old_text": "   7 | keep", "new_text": "   7 | kept"}
+        )
+
+        assert result.ok, result.output
+        assert result.pending_change.new_content == "   7 | kept\nreal line\n"
+
+
+class TestWhitespaceInsensitiveFallback:
+    """Fix 2: an edit whose only defect is indentation drift should succeed,
+    with the file's own indentation re-applied to the replacement."""
+
+    def test_wrong_base_indentation_still_matches_and_is_reindented(self, edit_tool):
+        """The recoverable drift: relative nesting is right, absolute
+        indentation is wrong (the file indents these 4 and 8 spaces)."""
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "if username == 'admin' and password == '1234':\n"
+                "    return {'token': 'abc123'}",
+                "new_text": "if verify(username, password):\n    return issue_token()",
+            }
+        )
+
+        assert result.ok, result.output
+        new = result.pending_change.new_content
+        assert "    if verify(username, password):\n" in new
+        assert "        return issue_token()\n" in new
+
+    def test_relative_nesting_is_preserved_when_reindenting(self, project, tracker):
+        """A .txt fixture so _validate_python_syntax can't mask what the
+        re-indent itself produced."""
+        (project.root / "note.txt").write_text("root\n    alpha\n        beta\n")
+        tool = build_edit_file_tool(project, tracker)
+
+        result = tool.execute(
+            {
+                "path": "note.txt",
+                # Nesting is right, base indent is wrong -> no literal match.
+                "old_text": "alpha\n    beta",
+                "new_text": "ALPHA\n    BETA\n        GAMMA",
+            }
+        )
+
+        assert result.ok, result.output
+        assert result.pending_change.new_content == (
+            "root\n    ALPHA\n        BETA\n            GAMMA\n"
+        )
+
+    def test_reindent_anchors_on_the_shallowest_matched_line(self, project, tracker):
+        (project.root / "deep.txt").write_text("root\n        deep\n    shallow\n")
+        tool = build_edit_file_tool(project, tracker)
+
+        result = tool.execute(
+            {
+                "path": "deep.txt",
+                "old_text": "deep\nshallow",
+                "new_text": "D\nS",
+            }
+        )
+
+        assert result.ok, result.output
+        # 4 (the shallowest matched line), not 8 (the first one).
+        assert result.pending_change.new_content == "root\n    D\n    S\n"
+
+    def test_fully_flattened_new_text_is_caught_by_the_syntax_check(self, edit_tool):
+        """Nesting the model never supplied cannot be invented. The
+        re-indent applies one base indent uniformly, and _validate_python_syntax
+        refuses the result rather than writing broken Python."""
+        result = edit_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "old_text": "if username == 'admin' and password == '1234':\n"
+                "return {'token': 'abc123'}",
+                "new_text": "if verify(username, password):\nreturn issue_token()",
+            }
+        )
+
+        assert not result.ok
+        assert "not valid python" in result.output.lower()
+        assert result.pending_change is None
+
+    def test_ambiguous_whitespace_match_is_rejected_without_replace_all(
+        self, project, tracker
+    ):
+        (project.root / "twice.py").write_text("def a():\n    x = 1\n\ndef b():\n  x = 1\n")
+        tool = build_edit_file_tool(project, tracker)
+
+        result = tool.execute({"path": "twice.py", "old_text": "x = 1", "new_text": "x = 2"})
+
+        assert not result.ok
+        assert "ambiguous" in result.output.lower()
+
+    def test_not_found_error_names_the_line_number_prefix_and_overwrite(self, edit_tool):
+        result = edit_tool.execute(
+            {"path": "backend/auth.py", "old_text": "nothing like this", "new_text": "x"}
+        )
+
+        assert not result.ok
+        assert "NNN | " in result.output
+        assert "overwrite=true" in result.output
+
+
+class TestReplaceAll:
+    """Fix 3: multiple occurrences report where they are, and replace_all
+    turns the hard failure into an explicit opt-in."""
+
+    def test_ambiguous_match_reports_line_numbers(self, edit_tool):
+        result = edit_tool.execute(
+            {"path": "backend/dup.py", "old_text": "x = 1", "new_text": "x = 2"}
+        )
+
+        assert not result.ok
+        assert "2 times" in result.output
+        assert "lines 1, 2" in result.output
+        assert "replace_all=true" in result.output
+
+    def test_replace_all_replaces_every_occurrence(self, edit_tool):
+        result = edit_tool.execute(
+            {
+                "path": "backend/dup.py",
+                "old_text": "x = 1",
+                "new_text": "x = 2",
+                "replace_all": True,
+            }
+        )
+
+        assert result.ok, result.output
+        assert result.pending_change.new_content == "x = 2\nx = 2\n"
+
+    def test_replace_all_defaults_to_false(self, edit_tool):
+        result = edit_tool.execute(
+            {"path": "backend/auth.py", "old_text": "return None", "new_text": "return {}"}
+        )
+        assert result.ok
+        assert result.pending_change.new_content.count("return {}") == 1
+
+    def test_replace_all_works_through_the_whitespace_fallback(self, project, tracker):
+        (project.root / "twice.py").write_text("def a():\n    x = 1\n\ndef b():\n  x = 1\n")
+        tool = build_edit_file_tool(project, tracker)
+
+        result = tool.execute(
+            {"path": "twice.py", "old_text": "x = 1", "new_text": "x = 2", "replace_all": True}
+        )
+
+        assert result.ok, result.output
+        # Each occurrence keeps its own original indentation.
+        assert result.pending_change.new_content == "def a():\n    x = 2\n\ndef b():\n  x = 2\n"
+
+
+class TestWriteFileOverwrite:
+    """Fix 4: a single-approval full-file rewrite, for when edit_file's anchor
+    matching keeps failing."""
+
+    def test_existing_file_without_overwrite_still_fails(self, write_tool):
+        result = write_tool.execute({"path": "backend/auth.py", "content": "x = 1\n"})
+
+        assert not result.ok
+        assert "already exists" in result.output
+        assert "overwrite=true" in result.output
+
+    def test_overwrite_proposes_an_edit_against_the_real_old_content(self, write_tool, project):
+        original = (project.root / "backend" / "auth.py").read_text()
+
+        result = write_tool.execute(
+            {
+                "path": "backend/auth.py",
+                "content": "def login(u, p):\n    return None\n",
+                "overwrite": True,
+            }
+        )
+
+        assert result.ok, result.output
+        change = result.pending_change
+        # kind="edit" so the CLI shows a real diff and "Modified file".
+        assert change.kind == "edit"
+        assert change.old_content == original
+        assert change.new_content == "def login(u, p):\n    return None\n"
+        assert change.original_mode is not None
+        # Still nothing written.
+        assert (project.root / "backend" / "auth.py").read_text() == original
+
+    def test_overwrite_still_validates_python_syntax(self, write_tool):
+        result = write_tool.execute(
+            {"path": "backend/auth.py", "content": "def broken(:\n", "overwrite": True}
+        )
+
+        assert not result.ok
+        assert "not valid python" in result.output.lower()
+        assert result.pending_change is None
+
+    def test_overwrite_with_identical_content_is_rejected(self, write_tool, project):
+        original = (project.root / "backend" / "auth.py").read_text()
+
+        result = write_tool.execute(
+            {"path": "backend/auth.py", "content": original, "overwrite": True}
+        )
+
+        assert not result.ok
+        assert "nothing to change" in result.output.lower()
+
+    def test_overwrite_still_refuses_a_sensitive_file(self, write_tool):
+        result = write_tool.execute(
+            {"path": "id_rsa", "content": "x\n", "overwrite": True}
+        )
+
+        assert not result.ok
+        assert "sensitive" in result.output.lower()
+
+    def test_overwrite_creates_a_new_file_when_none_exists(self, write_tool):
+        result = write_tool.execute(
+            {"path": "brand_new.py", "content": "x = 1\n", "overwrite": True}
+        )
+
+        assert result.ok, result.output
+        assert result.pending_change.kind == "create"
+        assert result.pending_change.old_content is None
+
+    def test_approved_overwrite_replaces_the_file_on_disk(self, write_tool, project, tracker):
+        result = write_tool.execute(
+            {"path": "backend/auth.py", "content": "x = 1\n", "overwrite": True}
+        )
+        assert result.ok, result.output
+
+        applied = apply_change(result.pending_change, tracker)
+
+        assert applied.ok, applied.output
+        assert (project.root / "backend" / "auth.py").read_text() == "x = 1\n"
